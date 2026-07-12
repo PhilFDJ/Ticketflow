@@ -268,8 +268,8 @@ def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None,
     # upsell, not a shop. JS reveals it (see recompute).
     prod_rows = []
     for p in (products or []):
-        # quantity None = unlimited
-        left = None if p["quantity"] is None else max(0, p["quantity"] - p["sold"])
+        # _left is pool-aware: a "3 for £5" shows 0 when fewer than 3 are in the box.
+        left = p.get("_left")
         if left is not None and left <= 0:
             prod_rows.append(f"""
               <div class="tt-row">
@@ -1262,13 +1262,25 @@ def admin_archive(events, stats_by_event, msg=None, err=None):
     """, admin=True)
 
 
-def admin_products(products, sales_by_product, msg=None, err=None):
+def admin_products(products, sales_by_product, pools=None, msg=None, err=None):
+    pools = pools or []
+    pool_by_id = {pl["id"]: pl for pl in pools}
+
+    def pool_opts(sel=""):
+        o = '<option value="">Its own stock</option>'
+        for pl in pools:
+            l = pl.get("_left")
+            lbl = f'{pl["name"]} ({"unlimited" if l is None else f"{l} left"})'
+            o += (f'<option value="{esc(pl["id"])}"'
+                  f'{" selected" if sel == pl["id"] else ""}>{esc(lbl)}</option>')
+        return o
+
     cards = []
     for p in products:
-        unlimited = p["quantity"] is None
-        left = None if unlimited else max(0, p["quantity"] - p["sold"])
+        left = p.get("_left")
+        pooled = pool_by_id.get(p.get("pool_id"))
 
-        if unlimited:
+        if left is None:
             stock = '<span class="pill">Unlimited</span>'
         elif left <= 0:
             stock = '<span class="pill bad">Sold out</span>'
@@ -1276,6 +1288,11 @@ def admin_products(products, sales_by_product, msg=None, err=None):
             stock = f'<span class="pill warn">{left} left</span>'
         else:
             stock = f'<span class="pill ok">{left} left</span>'
+
+        if pooled:
+            units = p.get("units") or 1
+            stock += (f' <span class="muted small">— takes {units} from '
+                      f'{esc(pooled["name"])}</span>')
 
         state = ("" if p["active"] else '<span class="pill">Off</span>')
 
@@ -1290,7 +1307,8 @@ def admin_products(products, sales_by_product, msg=None, err=None):
         else:
             sold_note = '<div class="muted small mt2">Not sold yet.</div>'
 
-        restock = ("" if unlimited else f"""
+        # Pooled products are restocked via their pool, not individually.
+        restock = ("" if (pooled or p["quantity"] is None) else f"""
           <form method="post" action="/admin/products/restock" class="row mt2"
                 style="gap:6px;align-items:center">
             <input type="hidden" name="id" value="{esc(p['id'])}">
@@ -1332,18 +1350,24 @@ def admin_products(products, sales_by_product, msg=None, err=None):
                 <div><label>Price (£)</label>
                   <input name="price" type="number" min="0" step="0.01"
                          value="{p['price']/100:.2f}" required></div>
-                <div><label>Total stock</label>
+                <div><label>Own stock <span class="muted small">(ignored if shared)</span></label>
                   <input name="quantity" type="number" min="0"
-                         value="{'' if unlimited else p['quantity']}"
+                         value="{'' if p['quantity'] is None else p['quantity']}"
                          placeholder="blank = unlimited"></div>
                 <div><label>Max per booking</label>
                   <input name="max_each" type="number" min="1" value="{p['max_each']}"></div>
+              </div>
+              <div class="row mt2" style="gap:8px">
+                <div><label>Stock</label>
+                  <select name="pool_id">{pool_opts(p.get('pool_id') or '')}</select></div>
+                <div><label>Takes how many?</label>
+                  <input name="units" type="number" min="1" value="{p.get('units') or 1}"></div>
               </div>
               <div class="mt2"><label>Description <span class="muted small">(optional)</span></label>
                 <input name="description" value="{esc(p['description'])}"></div>
               <label class="mt2" style="display:flex;align-items:center;gap:8px">
                 <input type="checkbox" name="unlimited" value="1" style="width:auto"
-                       {'checked' if unlimited else ''}>
+                       {'checked' if (p['quantity'] is None and not pooled) else ''}>
                 <span class="muted small">Unlimited — never runs out</span>
               </label>
               <div class="mt3">
@@ -1357,6 +1381,42 @@ def admin_products(products, sales_by_product, msg=None, err=None):
           </details>
         </div></div>""")
 
+    pool_cards = []
+    for pl in pools:
+        l = pl.get("_left")
+        badge = ('<span class="pill">Unlimited</span>' if l is None
+                 else '<span class="pill bad">Empty</span>' if l <= 0
+                 else f'<span class="pill ok">{l} left</span>')
+        uses = ", ".join(
+            f'{esc(x["name"])} (takes {x.get("units") or 1})'
+            for x in pl.get("_products", [])) or "nothing yet"
+        pool_cards.append(f"""
+        <div class="card mt2"><div class="body">
+          <div class="row" style="justify-content:space-between;align-items:flex-start;gap:12px">
+            <div>
+              <div style="font-weight:700">{esc(pl['name'])} {badge}</div>
+              <div class="muted small mt1">Used by: {uses}</div>
+              <div class="muted small">{pl['used']} used
+                {f"of {pl['quantity']}" if pl['quantity'] is not None else ''}</div>
+            </div>
+            <div style="flex:0 0 auto;text-align:right">
+              {f'''<form method="post" action="/admin/pools/restock" class="row"
+                    style="gap:6px;margin:0">
+                <input type="hidden" name="id" value="{esc(pl['id'])}">
+                <div style="max-width:100px">
+                  <input name="add" type="number" min="1" placeholder="+ stock"></div>
+                <div style="flex:0 0 auto">
+                  <button class="btn sec sm" type="submit">Restock</button></div>
+              </form>''' if pl['quantity'] is not None else ''}
+              <form method="post" action="/admin/pools/delete" style="margin:6px 0 0"
+                    onsubmit="return confirm('Remove this stock?')">
+                <input type="hidden" name="id" value="{esc(pl['id'])}">
+                <button class="btn ghost sm" type="submit">Remove</button>
+              </form>
+            </div>
+          </div>
+        </div></div>""")
+
     return layout("Extras", f"""
     <a href="/admin" class="muted small">← Dashboard</a>
     <h1 class="mt2">Extras</h1>
@@ -1367,19 +1427,43 @@ def admin_products(products, sales_by_product, msg=None, err=None):
 
     {''.join(cards) if cards else '<p class="muted mt3">Nothing set up yet.</p>'}
 
+    <h2 class="mt3">Shared stock</h2>
+    <p class="muted small">For when you sell the same thing more than one way —
+      "1 raffle strip £3" and "3 for £5" both come out of the same box. Create the
+      stock here, then point both products at it.</p>
+    {''.join(pool_cards) if pool_cards else '<p class="muted small">None yet.</p>'}
+
+    <div class="card mt2"><div class="body">
+      <form method="post" action="/admin/pools/add" class="row" style="gap:8px">
+        <div><label>What is it?</label>
+          <input name="name" placeholder="Raffle strips" required></div>
+        <div><label>How many have you got?</label>
+          <input name="quantity" type="number" min="1" placeholder="blank = unlimited"></div>
+        <div style="flex:0 0 auto;align-self:flex-end">
+          <button class="btn sec" type="submit">Add stock</button></div>
+      </form>
+    </div></div>
+
     <div class="card mt3"><div class="body">
       <h2 class="mt0">Add an extra</h2>
       <form method="post" action="/admin/products/add">
         <div class="row" style="gap:8px">
           <div><label>Name</label>
-            <input name="name" placeholder="Bingo dabber" required></div>
+            <input name="name" placeholder="3 raffle strips" required></div>
           <div><label>Price (£)</label>
             <input name="price" type="number" min="0" step="0.01"
-                   placeholder="2.50" required></div>
-          <div><label>Total stock</label>
-            <input name="quantity" type="number" min="1" placeholder="blank = unlimited"></div>
+                   placeholder="5.00" required></div>
           <div><label>Max per booking</label>
             <input name="max_each" type="number" min="1" value="10"></div>
+        </div>
+        <div class="row mt2" style="gap:8px">
+          <div><label>Stock</label>
+            <select name="pool_id">{pool_opts()}</select></div>
+          <div><label>Own stock <span class="muted small">(if not shared)</span></label>
+            <input name="quantity" type="number" min="1" placeholder="blank = unlimited"></div>
+          <div><label>Takes how many?</label>
+            <input name="units" type="number" min="1" value="1"
+                   title="A '3 for £5' takes 3 from the shared stock"></div>
         </div>
         <div class="mt2"><label>Description <span class="muted small">(optional)</span></label>
           <input name="description" placeholder="Collect at the door"></div>

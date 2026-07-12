@@ -175,6 +175,25 @@ def _migrate(conn):
             "sort_order,created_at FROM products_old")
         conn.execute("DROP TABLE products_old")
 
+    # Stock pools. A "1 raffle strip £3" and a "3 for £5" are separate things a
+    # buyer picks between, but they come out of the SAME box. A pool holds the real
+    # stock; each product says how many units of it a single purchase consumes.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS stock_pools (
+      id          TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      quantity    INTEGER,                 -- NULL = unlimited
+      used        INTEGER NOT NULL DEFAULT 0,
+      created_at  INTEGER NOT NULL
+    )""")
+
+    pcols = {r["name"] for r in conn.execute("PRAGMA table_info(products)")}
+    if "pool_id" not in pcols and "event_id" not in pcols:
+        # pool_id: which box this comes out of (NULL = its own stock, as before).
+        # units:   how many it takes from that box (a 3-pack takes 3).
+        conn.execute("ALTER TABLE products ADD COLUMN pool_id TEXT")
+        conn.execute("ALTER TABLE products ADD COLUMN units INTEGER NOT NULL DEFAULT 1")
+
     ocols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
     if "buyer_phone" not in ocols:
         # Phone number, so you can chase a no-show or an abandoned cart.
@@ -431,9 +450,11 @@ def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
         if not resolved:
             raise ValueError("No tickets selected")
 
-        # Add-ons (dabbers, vouchers). Stock is GLOBAL — a box of 40 dabbers is one
-        # box, shared across every event, so this can't oversell across nights.
+        # Add-ons. Stock is GLOBAL, and variants of the same thing ("1 for £3",
+        # "3 for £5") share a POOL — so a 3-pack takes 3 strips out of the box,
+        # and buying one variant reduces what's available of the other.
         resolved_products = []
+        pool_take = {}          # pool_id -> units this order wants
         for pid, qty in (products or []):
             if qty <= 0:
                 continue
@@ -444,14 +465,34 @@ def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
                 raise ValueError(f"{pr['name']} is no longer available.")
             if qty > pr["max_each"]:
                 raise ValueError(f"Maximum {pr['max_each']} {pr['name']} per booking.")
-            if pr["quantity"] is not None:          # NULL = unlimited
+
+            if pr["pool_id"]:
+                # Accumulate across variants — someone buying a single AND a 3-pack
+                # takes 4 from the box, and both must fit.
+                pool_take[pr["pool_id"]] = (pool_take.get(pr["pool_id"], 0)
+                                            + qty * max(1, pr["units"]))
+            elif pr["quantity"] is not None:      # own stock, NULL = unlimited
                 left = pr["quantity"] - pr["sold"]
                 if qty > left:
                     raise ValueError(
                         f"Only {left} {pr['name']} left." if left > 0
                         else f"{pr['name']} has sold out.")
+
             subtotal += pr["price"] * qty
             resolved_products.append((pid, qty, pr["price"]))
+
+        for poolid, want in pool_take.items():
+            pool = conn.execute("SELECT * FROM stock_pools WHERE id = ?",
+                                (poolid,)).fetchone()
+            if pool is None:
+                raise ValueError("Unknown stock.")
+            if pool["quantity"] is None:
+                continue                                   # unlimited
+            left = pool["quantity"] - pool["used"]
+            if want > left:
+                raise ValueError(
+                    f"Only {left} {pool['name']} left." if left > 0
+                    else f"{pool['name']} has sold out.")
 
     # If the price moved, don't silently charge more — stop and tell them.
     if price_changes:
@@ -549,11 +590,18 @@ def mark_order_paid(oid):
         conn.execute("UPDATE orders SET status = 'paid' WHERE id = ?", (oid,))
 
         # Add-on stock comes off at PAYMENT, same as tickets — so an abandoned
-        # cart doesn't sit on the last dabber.
+        # cart doesn't sit on the last dabber. Pooled variants draw from the pool
+        # (a 3-pack takes 3), not from their own count.
         for op in conn.execute("SELECT * FROM order_products WHERE order_id = ?",
                                (oid,)).fetchall():
+            pr = conn.execute("SELECT pool_id, units FROM products WHERE id = ?",
+                              (op["product_id"],)).fetchone()
             conn.execute("UPDATE products SET sold = sold + ? WHERE id = ?",
                          (op["qty"], op["product_id"]))
+            if pr and pr["pool_id"]:
+                conn.execute(
+                    "UPDATE stock_pools SET used = used + ? WHERE id = ?",
+                    (op["qty"] * max(1, pr["units"]), pr["pool_id"]))
 
         items = conn.execute("SELECT * FROM order_items WHERE order_id = ?",
                              (oid,)).fetchall()
@@ -1058,11 +1106,17 @@ def void_order_tickets(oid, reason="refunded"):
                 "UPDATE ticket_types SET sold = MAX(0, sold - 1) WHERE id = ?",
                 (t["ticket_type_id"],))
             n += 1
-        # Refunding also returns any add-ons to stock.
+        # Refunding also returns any add-ons to stock — including to the pool.
         for op in conn.execute("SELECT * FROM order_products WHERE order_id = ?",
                                (oid,)).fetchall():
+            pr = conn.execute("SELECT pool_id, units FROM products WHERE id = ?",
+                              (op["product_id"],)).fetchone()
             conn.execute("UPDATE products SET sold = MAX(0, sold - ?) WHERE id = ?",
                          (op["qty"], op["product_id"]))
+            if pr and pr["pool_id"]:
+                conn.execute(
+                    "UPDATE stock_pools SET used = MAX(0, used - ?) WHERE id = ?",
+                    (op["qty"] * max(1, pr["units"]), pr["pool_id"]))
 
         conn.execute(
             "UPDATE orders SET status = ?, refunded_at = ? WHERE id = ?",
@@ -1299,27 +1353,39 @@ def event_delete_summary(eid):
 # ---------------------------------------------------------------------------
 # Products (add-ons: dabbers, drinks vouchers, raffle strips)
 # ---------------------------------------------------------------------------
-def add_product(name, price, quantity=None, description="", max_each=10):
-    """quantity=None means UNLIMITED (drinks vouchers you can always print more of)."""
+def add_product(name, price, quantity=None, description="", max_each=10,
+                pool_id=None, units=1):
+    """quantity=None means UNLIMITED.
+
+    pool_id: draw stock from a shared pool instead of own stock. units: how many
+    of that pool one purchase consumes — a "3 for £5" raffle bundle has units=3,
+    so buying one takes 3 strips out of the box.
+    """
     if not name.strip():
         raise ValueError("Give the product a name.")
     if price < 0:
         raise ValueError("Price can't be negative.")
     if quantity is not None and quantity < 1:
         raise ValueError("Stock must be at least 1, or leave it blank for unlimited.")
+    if units < 1:
+        raise ValueError("Units must be at least 1.")
+    if pool_id and not get_pool(pool_id):
+        raise ValueError("Unknown stock.")
     pid = new_id("prd")
     with cursor() as conn:
         n = conn.execute("SELECT COUNT(*) c FROM products").fetchone()["c"]
         conn.execute(
             "INSERT INTO products (id,name,description,price,quantity,"
-            "sold,max_each,active,sort_order,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (pid, name.strip(), description.strip(), price, quantity,
-             0, max(1, max_each), 1, n, now()))
+            "sold,max_each,active,sort_order,created_at,pool_id,units) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (pid, name.strip(), description.strip(), price,
+             None if pool_id else quantity,      # pooled products don't hold own stock
+             0, max(1, max_each), 1, n, now(), pool_id or None, max(1, units)))
     return pid
 
 
 def update_product(pid, name=None, price=None, quantity=..., description=None,
-                   max_each=None):
+                   max_each=None, pool_id=..., units=None):
     """Edit a product. quantity=... means 'leave alone'; None means unlimited."""
     sets, params = [], []
     if name is not None:
@@ -1345,6 +1411,15 @@ def update_product(pid, name=None, price=None, quantity=..., description=None,
         sets.append("description = ?"); params.append(description.strip())
     if max_each is not None:
         sets.append("max_each = ?"); params.append(max(1, max_each))
+    if pool_id is not ...:
+        sets.append("pool_id = ?"); params.append(pool_id or None)
+        if pool_id:
+            # Pooled products don't hold their own stock — the pool does.
+            sets.append("quantity = ?"); params.append(None)
+    if units is not None:
+        if units < 1:
+            raise ValueError("Units must be at least 1.")
+        sets.append("units = ?"); params.append(units)
     if not sets:
         return
     params.append(pid)
@@ -1364,9 +1439,17 @@ def list_products(only_active=False):
 
 
 def available_products():
-    """Active products that aren't sold out — what a buyer actually sees."""
-    return [p for p in list_products(only_active=True)
-            if p["quantity"] is None or p["sold"] < p["quantity"]]
+    """Active products that aren't sold out — what a buyer actually sees.
+
+    Pool-aware: a "3 for £5" disappears when fewer than 3 are left in the box,
+    even though the "1 for £3" is still buyable.
+    """
+    out = []
+    for p in list_products(only_active=True):
+        left = product_stock_left(p)
+        if left is None or left > 0:
+            out.append(p)
+    return out
 
 
 def product_left(p):
@@ -1438,6 +1521,99 @@ def set_product_collected(order_id, product_id, collected=True):
             "UPDATE order_products SET collected = ? "
             "WHERE order_id = ? AND product_id = ?",
             (1 if collected else 0, order_id, product_id))
+
+
+# ---------------------------------------------------------------------------
+# Stock pools — shared stock behind product variants ("1 for £3" / "3 for £5")
+# ---------------------------------------------------------------------------
+def create_pool(name, quantity=None):
+    """quantity=None means unlimited."""
+    if not name.strip():
+        raise ValueError("Give the stock a name.")
+    if quantity is not None and quantity < 1:
+        raise ValueError("Stock must be at least 1, or blank for unlimited.")
+    poolid = new_id("pool")
+    with cursor() as conn:
+        conn.execute(
+            "INSERT INTO stock_pools (id,name,quantity,used,created_at) "
+            "VALUES (?,?,?,?,?)", (poolid, name.strip(), quantity, 0, now()))
+    return poolid
+
+
+def list_pools():
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT * FROM stock_pools ORDER BY created_at").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_pool(poolid):
+    with cursor() as conn:
+        row = conn.execute("SELECT * FROM stock_pools WHERE id = ?",
+                           (poolid,)).fetchone()
+    return dict(row) if row else None
+
+
+def pool_left(pool):
+    if pool is None or pool["quantity"] is None:
+        return None
+    return max(0, pool["quantity"] - pool["used"])
+
+
+def restock_pool(poolid, add):
+    with cursor() as conn:
+        row = conn.execute("SELECT quantity FROM stock_pools WHERE id = ?",
+                           (poolid,)).fetchone()
+        if row is None or row["quantity"] is None:
+            return
+        conn.execute("UPDATE stock_pools SET quantity = quantity + ? WHERE id = ?",
+                     (max(0, int(add)), poolid))
+
+
+def update_pool(poolid, name=None, quantity=...):
+    sets, params = [], []
+    if name is not None:
+        sets.append("name = ?"); params.append(name.strip())
+    if quantity is not ...:
+        if quantity is not None:
+            cur = get_pool(poolid)
+            if cur and quantity < cur["used"]:
+                raise ValueError(
+                    f"You've already used {cur['used']}. Stock can't be lower.")
+        sets.append("quantity = ?"); params.append(quantity)
+    if not sets:
+        return
+    params.append(poolid)
+    with cursor() as conn:
+        conn.execute(f"UPDATE stock_pools SET {', '.join(sets)} WHERE id = ?", params)
+
+
+def delete_pool(poolid):
+    with cursor() as conn:
+        n = conn.execute("SELECT COUNT(*) c FROM products WHERE pool_id = ?",
+                         (poolid,)).fetchone()["c"]
+        if n:
+            raise ValueError(
+                f"{n} product(s) still use this stock. Remove them first.")
+        conn.execute("DELETE FROM stock_pools WHERE id = ?", (poolid,))
+
+
+def product_stock_left(p):
+    """How many of THIS product can still be bought. None = unlimited.
+
+    A product either has its own stock, or draws from a shared pool. If it draws
+    from a pool and each purchase takes 3 units, then 7 units left means only 2
+    can be bought (7 // 3), not 7.
+    """
+    if p.get("pool_id"):
+        pool = get_pool(p["pool_id"])
+        left = pool_left(pool)
+        if left is None:
+            return None
+        return left // max(1, p.get("units") or 1)
+    if p["quantity"] is None:
+        return None
+    return max(0, p["quantity"] - p["sold"])
 
 
 def tickets_for_order(oid):

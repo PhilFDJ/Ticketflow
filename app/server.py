@@ -347,6 +347,16 @@ def home_embed(h):
                        pay_mode=payments.mode_label()))
 
 
+def _avail_products():
+    """Products a buyer can actually pick, with pool-aware stock attached."""
+    out = []
+    for p in db.available_products():
+        p = dict(p)
+        p["_left"] = db.product_stock_left(p)
+        out.append(p)
+    return out
+
+
 def _priced(tts):
     """Attach the CURRENT effective price to each ticket type.
 
@@ -384,7 +394,7 @@ def event_detail(h, eid):
     h.send_html(T.event_detail(event, tts, payments.is_live(), error=err,
                                fee_cfg=db.fee_config(),
                                show_remaining=db.get_setting("show_remaining") == "1",
-                               terms_required=db.terms_required(), products=db.available_products()))
+                               terms_required=db.terms_required(), products=_avail_products()))
 
 
 @route("POST", "/checkout")
@@ -418,7 +428,7 @@ def checkout(h):
 
     # Add-ons: prod_<id> = qty
     chosen_products = []
-    for pr in db.available_products():
+    for pr in _avail_products():
         q = int(flat.get(f"prod_{pr['id']}", "0") or 0)
         if q > 0:
             chosen_products.append((pr["id"], q))
@@ -427,7 +437,7 @@ def checkout(h):
             error="Please pick at least one ticket and enter your name, email and phone.",
             fee_cfg=db.fee_config(),
             show_remaining=db.get_setting("show_remaining") == "1",
-            terms_required=db.terms_required(), products=db.available_products()), 400)
+            terms_required=db.terms_required(), products=_avail_products()), 400)
     try:
         oid = db.create_order(eid, name, email, items,
                               provider=("stripe" if payments.is_live() else "mock"),
@@ -442,7 +452,7 @@ def checkout(h):
                                           fee_cfg=db.fee_config(),
                                           show_remaining=db.get_setting("show_remaining") == "1",
                                           terms_required=db.terms_required(),
-                                          products=db.available_products(),
+                                          products=_avail_products(),
                                           price_notice=pc.changes), 409)
     except ValueError as e:
         return h.send_html(T.event_detail(event, _priced(db.list_ticket_types(eid)),
@@ -450,7 +460,7 @@ def checkout(h):
                                           error=str(e), fee_cfg=db.fee_config(),
                                           show_remaining=db.get_setting("show_remaining") == "1",
                                           terms_required=db.terms_required(),
-                                          products=db.available_products()), 400)
+                                          products=_avail_products()), 400)
 
     order = db.get_order(oid)
     line_items = [{"name": db.get_ticket_type(tt)["name"], "qty": q,
@@ -1117,9 +1127,55 @@ def admin_products(h):
     if not require_admin(h):
         return
     prods = db.list_products()
+    for p in prods:
+        p["_left"] = db.product_stock_left(p)      # pool-aware
     sales = {p["id"]: db.product_sales_by_event(p["id"]) for p in prods}
-    h.send_html(T.admin_products(prods, sales,
+    pools = db.list_pools()
+    for pool in pools:
+        pool["_left"] = db.pool_left(pool)
+        pool["_products"] = [p for p in prods if p.get("pool_id") == pool["id"]]
+    h.send_html(T.admin_products(prods, sales, pools,
                                  msg=h.query.get("msg"), err=h.query.get("err")))
+
+
+@route("POST", "/admin/pools/add")
+def admin_pool_add(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    qty = (flat.get("quantity") or "").strip()
+    try:
+        db.create_pool(flat.get("name", ""), int(qty) if qty else None)
+    except ValueError as e:
+        return h.redirect(f"/admin/products?err={urllib.parse.quote(str(e))}")
+    h.redirect("/admin/products?msg=Stock+added")
+
+
+@route("POST", "/admin/pools/restock")
+def admin_pool_restock(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    try:
+        add = int(flat.get("add", "0") or 0)
+    except ValueError:
+        add = 0
+    if add > 0:
+        db.restock_pool(flat.get("id", ""), add)
+        return h.redirect(f"/admin/products?msg={urllib.parse.quote(f'Added {add} to stock.')}")
+    h.redirect("/admin/products")
+
+
+@route("POST", "/admin/pools/delete")
+def admin_pool_delete(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    try:
+        db.delete_pool(flat.get("id", ""))
+    except ValueError as e:
+        return h.redirect(f"/admin/products?err={urllib.parse.quote(str(e))}")
+    h.redirect("/admin/products?msg=Stock+removed")
 
 
 @route("POST", "/admin/products/add")
@@ -1135,6 +1191,8 @@ def admin_product_add(h):
             quantity=(int(qty_raw) if qty_raw else None),   # blank = unlimited
             description=flat.get("description", ""),
             max_each=int(flat.get("max_each", "10") or 10),
+            pool_id=(flat.get("pool_id") or None),
+            units=int(flat.get("units", "1") or 1),
         )
     except ValueError as e:
         return h.redirect(f"/admin/products?err={urllib.parse.quote(str(e))}")
@@ -1157,6 +1215,8 @@ def admin_product_edit(h):
             quantity=(None if unlimited else (int(qty_raw) if qty_raw else None)),
             description=flat.get("description", ""),
             max_each=int(flat.get("max_each", "10") or 10),
+            pool_id=(flat.get("pool_id") or None),
+            units=int(flat.get("units", "1") or 1),
         )
     except ValueError as e:
         return h.redirect(f"/admin/products?err={urllib.parse.quote(str(e))}")
