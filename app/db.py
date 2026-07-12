@@ -152,6 +152,12 @@ def _migrate(conn):
         # Full venue address, so punters can get directions. `venue` is just the
         # name ("The Social Club"); this is the postal address.
         conn.execute("ALTER TABLE events ADD COLUMN address TEXT NOT NULL DEFAULT ''")
+    if "archived_at" not in ecols:
+        # Archiving hides an event from the dashboard and the public list. It is
+        # NOT deletion: tickets stay scannable, orders and revenue stay intact.
+        # `published` is a different thing (draft vs live) — a past event is
+        # normally published AND archived.
+        conn.execute("ALTER TABLE events ADD COLUMN archived_at INTEGER")
 
 
 def connect():
@@ -232,18 +238,46 @@ def get_event(eid):
     return dict(row) if row else None
 
 
-def list_events(only_published=False, include_past=True):
+def list_events(only_published=False, include_past=True, archived=False):
+    """archived=False -> live events (the default everywhere).
+       archived=True  -> only the archive.
+       archived=None  -> everything, archived or not."""
     q = "SELECT * FROM events"
     conds = []
     if only_published:
         conds.append("published = 1")
     if not include_past:
         conds.append(f"starts_at >= {now()}")
+    if archived is True:
+        conds.append("archived_at IS NOT NULL")
+    elif archived is False:
+        conds.append("archived_at IS NULL")
     if conds:
         q += " WHERE " + " AND ".join(conds)
-    q += " ORDER BY starts_at ASC"
+    q += " ORDER BY starts_at ASC" if not archived else " ORDER BY starts_at DESC"
     with cursor() as conn:
         rows = conn.execute(q).fetchall()
+    return [dict(r) for r in rows]
+
+
+def archive_event(eid, archived=True):
+    """Hide an event from the dashboard and the public list.
+
+    Deliberately NOT a delete. Tickets stay valid and scannable (someone might
+    turn up late, or you might need to check a name weeks later), orders and
+    revenue stay intact, and it can be undone.
+    """
+    with cursor() as conn:
+        conn.execute("UPDATE events SET archived_at = ? WHERE id = ?",
+                     (now() if archived else None, eid))
+
+
+def archivable_events():
+    """Past events that aren't archived yet — offered as a one-click tidy-up."""
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT * FROM events WHERE archived_at IS NULL AND starts_at < ? "
+            "ORDER BY starts_at DESC", (now(),)).fetchall()
     return [dict(r) for r in rows]
 
 

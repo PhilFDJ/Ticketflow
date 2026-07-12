@@ -369,6 +369,16 @@ def event_detail(h, eid):
     event = db.get_event(eid)
     if not event or not event["published"]:
         return h.send_html(T.layout("Not found", "<h1>Event not found</h1>"), 404)
+    if event.get("archived_at"):
+        # Archived = it's over. Don't let someone with an old link buy a ticket
+        # for a finished night, but don't 404 either — the page may still be
+        # linked from somewhere.
+        return h.send_html(T.layout("Event finished", f"""
+        <div class="narrow" style="margin:0 auto">
+          <h1>{esc_html(event['title'])}</h1>
+          <p class="lead">This event has finished — tickets are no longer on sale.</p>
+          <p class="mt3"><a class="btn" href="/">See what's coming up →</a></p>
+        </div>"""), 410)
     tts = _priced(db.list_ticket_types(eid))
     err = "Payment cancelled — your tickets weren't purchased." if h.query.get("cancelled") else None
     h.send_html(T.event_detail(event, tts, payments.is_live(), error=err,
@@ -384,6 +394,13 @@ def checkout(h):
     event = db.get_event(eid)
     if not event:
         return h.send_html(T.layout("Error", '<div class="flash err">Unknown event</div>'), 400)
+    if event.get("archived_at"):
+        # Also enforced here, not just on the page — otherwise someone could POST
+        # straight to checkout for a finished event.
+        return h.send_html(T.layout("Event finished",
+            '<div class="narrow" style="margin:0 auto">'
+            '<div class="flash err">This event has finished — tickets are no longer '
+            'on sale.</div><a href="/">← See what\'s coming up</a></div>'), 410)
     tts = db.list_ticket_types(eid)
     items = []
     for t in tts:
@@ -549,6 +566,10 @@ def ticket_pass(h, code):
     h.wfile.write(data)
 
 
+def esc_html(t):
+    return _html.escape(str(t or ""))
+
+
 def esc_code(c):
     return re.sub(r"[^\w\-]", "", c or "")
 
@@ -643,6 +664,38 @@ def admin_test_email(h):
         "from": mailer.from_address(),
         "reply_to": mailer.reply_to(),
     })
+
+
+@route("POST", "/admin/events/archive")
+def admin_event_archive(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    eid = flat.get("id", "")
+    on = flat.get("archived") == "1"
+    db.archive_event(eid, on)
+    h.redirect(flat.get("back") or "/admin")
+
+
+@route("POST", "/admin/events/archive-past")
+def admin_archive_past(h):
+    """One-click tidy-up: archive everything that's already happened."""
+    if not require_admin(h):
+        return
+    n = 0
+    for e in db.archivable_events():
+        db.archive_event(e["id"], True)
+        n += 1
+    h.redirect(f"/admin?archived={n}")
+
+
+@route("GET", "/admin/archive")
+def admin_archive(h):
+    if not require_admin(h):
+        return
+    events = db.list_events(archived=True)
+    stats = {e["id"]: db.event_stats(e["id"]) for e in events}
+    h.send_html(T.admin_archive(events, stats))
 
 
 @route("GET", "/terms")
@@ -1028,7 +1081,9 @@ def admin_dashboard(h):
                                   mail_reply=mailer.reply_to(),
                                   wallet_on=wallet.is_configured(),
                                   wallet_problem=wallet.config_problem(),
-                                  pay_mode=payments.mode_label()))
+                                  pay_mode=payments.mode_label(),
+                                  past_count=len(db.archivable_events()),
+                                  archived_count=len(db.list_events(archived=True))))
 
 
 @route("GET", "/admin/events/new")

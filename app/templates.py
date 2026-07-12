@@ -988,6 +988,50 @@ def admin_discounts(discounts, events, error=None, fee_cfg=None, saved=False,
     """, admin=True)
 
 
+def admin_archive(events, stats_by_event):
+    rows = []
+    total = 0
+    for e in events:
+        s = stats_by_event[e["id"]]
+        total += s["revenue"]
+        rows.append(f"""
+        <tr>
+          <td><a href="/admin/events/{esc(e['id'])}">{esc(e['title'])}</a><br>
+            <span class="muted small">{esc(fmt_date(e['starts_at'], with_time=False))}
+              · {esc(e['venue'])}</span></td>
+          <td>{s['sold']} / {s['capacity']}</td>
+          <td>{s['scanned']}</td>
+          <td>{money(s['revenue'], e['currency'])}</td>
+          <td style="white-space:nowrap">
+            <a class="btn ghost sm" href="/admin/events/{esc(e['id'])}/door">Door list</a>
+            <form method="post" action="/admin/events/archive" style="display:inline;margin:0">
+              <input type="hidden" name="id" value="{esc(e['id'])}">
+              <input type="hidden" name="archived" value="0">
+              <input type="hidden" name="back" value="/admin/archive">
+              <button class="btn ghost sm" type="submit">Restore</button>
+            </form>
+          </td>
+        </tr>""")
+
+    return layout("Archive", f"""
+    <a href="/admin" class="muted small">← Dashboard</a>
+    <h1 class="mt2">Archive</h1>
+    <p class="lead">Past events, out of the way but not gone.</p>
+
+    <div class="card mt2"><div class="body">
+      {'<table><thead><tr><th>Event</th><th>Sold</th><th>Scanned</th><th>Revenue</th>'
+       '<th></th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table>'
+       if rows else '<p class="muted">Nothing archived yet.</p>'}
+    </div></div>
+
+    {f'<p class="muted small mt2">Total from archived events: <b>{money(total)}</b></p>' if rows else ''}
+
+    <p class="muted small mt3">Archiving only hides an event. Its tickets stay valid and
+      scannable, the door list still works, and the orders and revenue are all still
+      counted. Restore it any time.</p>
+    """, admin=True)
+
+
 def terms_page(text):
     return layout("Terms & conditions", f"""
     <div class="narrow" style="margin:0 auto">
@@ -1196,7 +1240,7 @@ def admin_login(error=None, next_url=""):
     </div>""")
 
 
-def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from="", mail_reply="", wallet_on=False, wallet_problem="", pay_mode="mock"):
+def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from="", mail_reply="", wallet_on=False, wallet_problem="", pay_mode="mock", past_count=0, archived_count=0):
     rows = []
     tot_rev = 0
     for e in events:
@@ -1210,9 +1254,16 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
           <td>{s['sold']} / {s['capacity']}</td>
           <td>{s['scanned']}</td>
           <td>{money(s['revenue'], e['currency'])}</td>
+          <td><form method="post" action="/admin/events/archive" style="margin:0">
+            <input type="hidden" name="id" value="{esc(e['id'])}">
+            <input type="hidden" name="archived" value="1">
+            <input type="hidden" name="back" value="/admin">
+            <button class="btn ghost sm" type="submit"
+              title="Hide from the dashboard. Tickets stay valid.">Archive</button>
+          </form></td>
         </tr>""")
     table = (f"<table><thead><tr><th>Event</th><th>Status</th><th>Sold</th>"
-             f"<th>Scanned</th><th>Revenue</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"
+             f"<th>Scanned</th><th>Revenue</th><th></th></tr></thead><tbody>{''.join(rows)}</tbody></table>"
              if rows else '<p class="muted">No events yet — create your first below.</p>')
     # Three genuinely different states — conflating test with live is how someone
     # ends up taking real money while thinking they're testing.
@@ -1222,6 +1273,17 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
         mode = '<span class="pill warn">Stripe TEST mode — no real money</span>'
     else:
         mode = '<span class="pill warn">Mock payments — Stripe not connected</span>'
+    # Offer a one-click tidy-up when past events are cluttering the list.
+    tidy_prompt = ("" if not past_count else f'''
+    <div class="flash info mt3" style="display:flex;justify-content:space-between;
+         align-items:center;gap:12px;flex-wrap:wrap">
+      <span>You have <b>{past_count}</b> event{'s' if past_count != 1 else ''} that
+        {'have' if past_count != 1 else 'has'} already happened.</span>
+      <form method="post" action="/admin/events/archive-past" style="margin:0">
+        <button class="btn sec sm" type="submit">Archive them</button>
+      </form>
+    </div>''')
+
     mail_badge = ('<span class="pill ok">On</span>' if mail_on
                   else '<span class="pill bad">Off</span>')
     wallet_badge = ('<span class="pill ok">On</span>' if wallet_on
@@ -1255,8 +1317,11 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
     </div>
     <div class="card mt3"><div class="body">{table}</div></div>
 
+    {tidy_prompt}
+
     <div class="row mt3" style="gap:8px;flex-wrap:wrap">
       <a class="btn" href="/admin/orders">📋 All orders &amp; customers</a>
+      <a class="btn sec" href="/admin/archive">🗄️ Archive{f' ({archived_count})' if archived_count else ''}</a>
       <a class="btn sec" href="/admin/orders?status=pending">🛒 Abandoned carts</a>
       <a class="btn sec" href="/admin/discounts">🏷️ Discount codes</a>
       <a class="btn sec" href="/admin/terms">📄 Terms &amp; conditions</a>
