@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, os.path.dirname(__file__))
 import db
 import mailer
+import backup
 import payments
 import wallet
 import qrgen
@@ -1039,6 +1040,57 @@ def admin_archive_past(h):
     h.redirect(f"/admin?archived={n}")
 
 
+@route("GET", "/admin/backups")
+def admin_backups(h):
+    if not require_admin(h):
+        return
+    h.send_html(T.admin_backups(backup.status(), backup.list_snapshots(),
+                                msg=h.query.get("msg"), err=h.query.get("err")))
+
+
+@route("POST", "/admin/backups/now")
+def admin_backup_now(h):
+    """Force a backup right now — before you do anything risky."""
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    try:
+        path, size = backup.write_snapshot()
+    except Exception as e:
+        return h.redirect(f"/admin/backups?err={urllib.parse.quote(str(e))}")
+
+    msg = f"Snapshot saved ({size/1024:.0f} KB)."
+    if flat.get("email") == "1":
+        ok, m = backup.email_snapshot()
+        msg += f" {m}" if ok else f" But the email failed: {m}"
+        if not ok:
+            return h.redirect(f"/admin/backups?err={urllib.parse.quote(msg)}")
+    h.redirect(f"/admin/backups?msg={urllib.parse.quote(msg)}")
+
+
+@route("GET", "/admin/backups/download")
+def admin_backup_download(h):
+    """Download one of the automatic snapshots."""
+    if not require_admin(h):
+        return
+    name = h.query.get("name", "")
+    # Only ever serve a file from the backup directory — never a path someone
+    # supplies. "../../etc/passwd" must not be downloadable.
+    if "/" in name or "\\" in name or not name.endswith(".db"):
+        return h.send_html(T.layout("Error", "<h1>Bad request</h1>"), 400)
+    path = os.path.join(backup.BACKUP_DIR, name)
+    if not os.path.isfile(path):
+        return h.send_html(T.layout("Not found", "<h1>No such backup</h1>"), 404)
+    with open(path, "rb") as f:
+        data = f.read()
+    h.send_response(200)
+    h.send_header("Content-Type", "application/octet-stream")
+    h.send_header("Content-Disposition", f'attachment; filename="{name}"')
+    h.send_header("Content-Length", str(len(data)))
+    h.end_headers()
+    h.wfile.write(data)
+
+
 @route("GET", "/admin/backup")
 def admin_backup(h):
     """Download the whole database.
@@ -1513,10 +1565,13 @@ def admin_event_csv(h, eid):
     buf = _io.StringIO()
     w = csv.writer(buf)
     w.writerow(["Name", "Email", "Ticket type", "Ticket code",
-                "Status", "Checked in at", "Order ref", "Party size"])
+                "Status", "Checked in at", "Order ref", "Party size", "Extras"])
 
     for p in db.event_attendance(eid):
-        for t in p["tickets"]:
+        # Extras are per booking, so they go on the party's first row only.
+        extras = " · ".join(f"{pr['qty']}x {pr['name']}"
+                            for pr in p.get("products", []))
+        for i, t in enumerate(p["tickets"]):
             scanned = ""
             if t["scanned_at"]:
                 scanned = time.strftime("%d/%m/%Y %H:%M",
@@ -1530,6 +1585,7 @@ def admin_event_csv(h, eid):
                 scanned,
                 p["order_id"],
                 p["total"],
+                extras if i == 0 else "",
             ])
 
     data = buf.getvalue().encode("utf-8-sig")   # BOM so Excel opens it cleanly
@@ -1928,6 +1984,13 @@ def main():
             seed.run()
         except Exception as e:
             sys.stderr.write(f"(seed skipped: {e})\n")
+
+    # Automatic backups. Disable with BACKUP_OFF=1 (e.g. in tests).
+    if not os.environ.get("BACKUP_OFF"):
+        try:
+            backup.start()
+        except Exception as e:
+            sys.stderr.write(f"(backups failed to start: {e})\n")
 
     # Say plainly whether tickets will be emailed. This used to fail silently —
     # no key meant no email and no warning, which is impossible to diagnose from

@@ -57,7 +57,8 @@ def send(to_email: str, subject: str, html: str, text: str = "") -> bool:
     return ok
 
 
-def send_verbose(to_email: str, subject: str, html: str, text: str = ""):
+def send_verbose(to_email: str, subject: str, html: str, text: str = "",
+                 attachments=None):
     """Same as send(), but also returns the error message.
 
     Used by the admin test-email tool: normally failures are swallowed so a sale
@@ -71,8 +72,11 @@ def send_verbose(to_email: str, subject: str, html: str, text: str = ""):
         return False, "No mail provider configured (RESEND_API_KEY / SMTP_HOST)."
     try:
         if _resend_key():
-            ok = _send_resend(to_email, subject, html, text)
+            ok = _send_resend(to_email, subject, html, text, attachments=attachments)
         else:
+            if attachments:
+                return False, ("Attachments need Resend (SMTP path doesn't "
+                               "support them here).")
             ok = _send_smtp(to_email, subject, html, text)
         return ok, None if ok else "Provider rejected the message."
     except urllib.error.HTTPError as e:
@@ -109,7 +113,7 @@ def send_verbose(to_email: str, subject: str, html: str, text: str = ""):
         return False, str(e)
 
 
-def _send_resend(to_email, subject, html, text) -> bool:
+def _send_resend(to_email, subject, html, text, attachments=None) -> bool:
     payload = {
         "from": from_address(),
         "to": [to_email],
@@ -121,6 +125,9 @@ def _send_resend(to_email, subject, html, text) -> bool:
         payload["reply_to"] = rt
     if text:
         payload["text"] = text
+    if attachments:
+        # Resend wants base64 content. Used for the off-site database backup.
+        payload["attachments"] = attachments
     req = urllib.request.Request(
         "https://api.resend.com/emails",
         data=json.dumps(payload).encode(),

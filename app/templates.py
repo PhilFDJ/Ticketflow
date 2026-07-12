@@ -1262,6 +1262,99 @@ def admin_archive(events, stats_by_event, msg=None, err=None):
     """, admin=True)
 
 
+def admin_backups(status, snapshots, msg=None, err=None):
+    def ago(ts):
+        if not ts:
+            return "never"
+        mins = int((time.time() - ts) / 60)
+        if mins < 60:
+            return f"{mins} min ago"
+        if mins < 1440:
+            return f"{mins // 60}h ago"
+        return f"{mins // 1440}d ago"
+
+    rows = []
+    for s in snapshots[:14]:
+        rows.append(f"""
+        <tr>
+          <td>{time.strftime('%a %d %b, %H:%M', time.localtime(s['when']))}
+            <span class="muted small">· {ago(s['when'])}</span></td>
+          <td class="muted small">{s['size']/1024:.0f} KB</td>
+          <td><a class="btn ghost sm"
+                 href="/admin/backups/download?name={esc(s['name'])}">Download</a></td>
+        </tr>""")
+
+    # Be blunt about the gap. An on-disk backup does NOT save you if the disk dies.
+    if status["email_on"]:
+        offsite = f"""
+        <div class="flash ok">
+          <b>Off-site copy is on.</b> A complete copy of the database is emailed to
+          <b>{esc(status['email_to'])}</b> every day. That's what saves you if the
+          server's disk fails — keep those emails.
+        </div>"""
+    else:
+        offsite = """
+        <div class="flash err">
+          <b>No off-site copy.</b> Snapshots below live on the same disk as the
+          database — if that disk dies, they die with it. Set
+          <code>BACKUP_EMAIL</code> in Render to have a copy emailed to you daily.
+        </div>"""
+
+    return layout("Backups", f"""
+    <a href="/admin" class="muted small">← Dashboard</a>
+    <h1 class="mt2">Backups</h1>
+    {flash("ok", msg) if msg else ""}
+    {flash("err", err) if err else ""}
+
+    {offsite}
+
+    <div class="grid cols-3 mt3">
+      <div class="stat"><div class="n">{len(snapshots)}</div>
+        <div class="l">Snapshots kept</div></div>
+      <div class="stat"><div class="n">{ago(snapshots[0]['when']) if snapshots else '—'}</div>
+        <div class="l">Last snapshot</div></div>
+      <div class="stat"><div class="n">{ago(status['last_email'])}</div>
+        <div class="l">Last emailed</div></div>
+    </div>
+
+    {flash("err", "Last backup error: " + status["last_error"])
+     if status["last_error"] else ""}
+
+    <div class="card mt3"><div class="body">
+      <h2 class="mt0">Back up right now</h2>
+      <p class="muted small">Do this before anything risky — deleting an event,
+        or a big change.</p>
+      <form method="post" action="/admin/backups/now" class="row mt2" style="gap:8px">
+        <div style="flex:0 0 auto">
+          <button class="btn" type="submit">Take a snapshot</button></div>
+        <div style="flex:0 0 auto">
+          <input type="hidden" name="email" value="1">
+          <button class="btn sec" type="submit">Snapshot + email it to me</button></div>
+      </form>
+    </div></div>
+
+    <div class="card mt3"><div class="body">
+      <h2 class="mt0">Recent snapshots</h2>
+      {'<table><thead><tr><th>When</th><th>Size</th><th></th></tr></thead><tbody>'
+       + ''.join(rows) + '</tbody></table>' if rows
+       else '<p class="muted">None yet — the first runs shortly after startup.</p>'}
+      <p class="muted small mt2">The most recent {14} are kept; older ones are
+        deleted automatically so they can't fill the disk.</p>
+    </div></div>
+
+    <div class="card mt3"><div class="body">
+      <h2 class="mt0">If the worst happens</h2>
+      <p class="muted small">To restore: take a <code>.db</code> file (from a
+        download here, or from a backup email), put it on the server at
+        <code>/var/data/ticketflow.db</code>, and restart the service. Everything —
+        orders, tickets, customers, takings — comes back as of that snapshot.</p>
+      <p class="muted small mt2">Long term, moving to Postgres would give you proper
+        managed backups. Worth doing if this becomes serious money; not worth doing
+        before your first few nights.</p>
+    </div></div>
+    """, admin=True)
+
+
 def admin_products(products, sales_by_product, pools=None, msg=None, err=None):
     pools = pools or []
     pool_by_id = {pl["id"]: pl for pl in pools}
@@ -1796,6 +1889,18 @@ def door_sheet(event, parties):
     with a pen at the door when the scanner won't play ball.
     """
     total_tickets = sum(p["total"] for p in parties)
+
+    # What you physically have to hand over across the night. If you're carrying a
+    # box of dabbers to the venue, this is the number you need before you leave.
+    owed = {}
+    for p in parties:
+        for pr in p.get("products", []):
+            owed[pr["name"]] = owed.get(pr["name"], 0) + pr["qty"]
+    owed_line = ""
+    if owed:
+        bits = " · ".join(f"<b>{v}×</b> {esc(k)}" for k, v in sorted(owed.items()))
+        owed_line = f'<div class="owed">To hand out: {bits}</div>'
+
     rows = []
     for p in parties:
         for i, t in enumerate(p["tickets"]):
@@ -1804,10 +1909,22 @@ def door_sheet(event, parties):
             name = esc(p["buyer_name"] or "Unknown") if i == 0 else ""
             party = f'<span class="pty">party of {p["total"]}</span>' if (i == 0 and p["total"] > 1) else ""
             already = ' <span class="wasin">(scanned in)</span>' if t["status"] == "used" else ""
+
+            # Extras go on the FIRST row of the party — they're bought per booking,
+            # not per ticket — each with its own tick box, because you have to
+            # physically hand them over.
+            extras = ""
+            if i == 0 and p.get("products"):
+                chips = "".join(
+                    f'<span class="ex"><span class="exbox"></span>'
+                    f'{pr["qty"]}× {esc(pr["name"])}</span>'
+                    for pr in p["products"])
+                extras = f'<div class="extras">{chips}</div>'
+
             rows.append(f"""
             <tr>
               <td class="tick"></td>
-              <td class="nm">{name} {party}</td>
+              <td class="nm">{name} {party}{extras}</td>
               <td class="tt">{esc(t['ticket_name'])}</td>
               <td class="cd">{esc(t['code'][-8:])}{already}</td>
             </tr>""")
@@ -1835,6 +1952,14 @@ def door_sheet(event, parties):
   .tt{{color:#333;width:130px}}
   .cd{{font-family:ui-monospace,Menlo,monospace;color:#333;width:150px;font-size:12px}}
   .wasin{{color:#0a7a34;font-weight:600;font-family:inherit;font-size:11px}}
+  /* Extras they've paid for and you have to hand over. Own tick box each. */
+  .extras{{margin-top:5px;font-weight:400;font-size:12px}}
+  .ex{{display:inline-flex;align-items:center;gap:5px;margin-right:12px;
+    border:1px solid #999;border-radius:4px;padding:2px 7px 2px 5px;background:#f4f4f4}}
+  .exbox{{display:inline-block;width:12px;height:12px;border:2px solid #000;
+    border-radius:2px}}
+  .owed{{border:2px solid #000;border-radius:6px;padding:9px 12px;margin:10px 0 4px;
+    font-size:13px;background:#f4f4f4}}
   tr{{break-inside:avoid;page-break-inside:avoid}}
   .noprint{{margin-bottom:16px}}
   @media print{{ .noprint{{display:none}} body{{padding:0}} @page{{margin:12mm}} }}
@@ -1848,6 +1973,7 @@ def door_sheet(event, parties):
 
   <h1>{esc(event['title'])}</h1>
   <p class="sub">{esc(event['venue'])} · {esc(fmt_date(event['starts_at']))}</p>
+  {owed_line}
   <p class="meta">{total_tickets} ticket{'s' if total_tickets != 1 else ''} sold ·
      {len(parties)} booking{'s' if len(parties) != 1 else ''} ·
      printed {time.strftime('%d/%m/%Y %H:%M')}</p>
@@ -1971,8 +2097,7 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
       <a class="btn sec" href="/admin/products">🎯 Extras</a>
       <a class="btn sec" href="/admin/lookup">🔎 Find a customer</a>
       <a class="btn sec" href="/admin/terms">📄 Terms &amp; conditions</a>
-      <a class="btn sec" href="/admin/backup"
-         title="Download the whole database. Keep it somewhere that isn't Render.">⤓ Backup database</a>
+      <a class="btn sec" href="/admin/backups">💾 Backups</a>
     </div>
 
     <div class="card mt3"><div class="body">

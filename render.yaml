@@ -72,5 +72,11 @@ services:
       - key: PUBLIC_BASE_URL
         value: https://tickets.mayhembingo.co.uk
 
+      # Automatic off-site backups — the database is emailed here daily.
+      # Without this, snapshots live on the same disk as the database and won't
+      # save you if that disk dies. See WEBHOOK-REFUNDS-BACKUPS.md
+      - key: BACKUP_EMAIL
+        sync: false
+
       - key: PYTHON_VERSION
         value: "3.11.9"
