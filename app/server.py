@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -346,14 +347,33 @@ def home_embed(h):
                        pay_mode=payments.mode_label()))
 
 
+def _priced(tts):
+    """Attach the CURRENT effective price to each ticket type.
+
+    Both the event page and the checkout read prices through here, so what's shown
+    is what's charged.
+    """
+    out = []
+    for t in tts:
+        t = dict(t)
+        price, tier = db.effective_price(t)
+        t["_price"] = price
+        t["_tier"] = tier
+        t["_tier_info"] = db.price_tier_summary(t)
+        out.append(t)
+    return out
+
+
 @route("GET", r"/events/(?P<eid>[\w]+)")
 def event_detail(h, eid):
     event = db.get_event(eid)
     if not event or not event["published"]:
         return h.send_html(T.layout("Not found", "<h1>Event not found</h1>"), 404)
-    tts = db.list_ticket_types(eid)
+    tts = _priced(db.list_ticket_types(eid))
     err = "Payment cancelled — your tickets weren't purchased." if h.query.get("cancelled") else None
-    h.send_html(T.event_detail(event, tts, payments.is_live(), error=err, fee_cfg=db.fee_config()))
+    h.send_html(T.event_detail(event, tts, payments.is_live(), error=err,
+                               fee_cfg=db.fee_config(),
+                               show_remaining=db.get_setting("show_remaining") == "1"))
 
 
 @route("POST", "/checkout")
@@ -373,17 +393,32 @@ def checkout(h):
     email = flat.get("buyer_email", "").strip()
     phone = flat.get("buyer_phone", "").strip()
     dcode = flat.get("discount_code", "").strip()
+    # What the page QUOTED them. If a tier has moved on since, we refuse rather
+    # than silently charging more (see db.PriceChanged).
+    quoted = {k[len("quoted_"):]: v for k, v in flat.items() if k.startswith("quoted_")}
     if not items or not name or not email or not phone:
-        return h.send_html(T.event_detail(event, tts, payments.is_live(),
-            error="Please pick at least one ticket and enter your name, email and phone.", fee_cfg=db.fee_config()), 400)
+        return h.send_html(T.event_detail(event, _priced(tts), payments.is_live(),
+            error="Please pick at least one ticket and enter your name, email and phone.",
+            fee_cfg=db.fee_config(),
+            show_remaining=db.get_setting("show_remaining") == "1"), 400)
     try:
         oid = db.create_order(eid, name, email, items,
                               provider=("stripe" if payments.is_live() else "mock"),
                               currency=event["currency"], buyer_phone=phone,
-                              discount_code=dcode)
+                              discount_code=dcode, quoted_prices=quoted)
+    except db.PriceChanged as pc:
+        # Show them the new price and let them decide. Never charge a price they
+        # weren't shown.
+        return h.send_html(T.event_detail(event, _priced(db.list_ticket_types(eid)),
+                                          payments.is_live(),
+                                          fee_cfg=db.fee_config(),
+                                          show_remaining=db.get_setting("show_remaining") == "1",
+                                          price_notice=pc.changes), 409)
     except ValueError as e:
-        return h.send_html(T.event_detail(event, tts, payments.is_live(),
-                                          error=str(e), fee_cfg=db.fee_config()), 400)
+        return h.send_html(T.event_detail(event, _priced(db.list_ticket_types(eid)),
+                                          payments.is_live(),
+                                          error=str(e), fee_cfg=db.fee_config(),
+                                          show_remaining=db.get_setting("show_remaining") == "1"), 400)
 
     order = db.get_order(oid)
     line_items = [{"name": db.get_ticket_type(tt)["name"], "qty": q,
@@ -524,11 +559,23 @@ def ticket_view(h, code):
 # ---- scanning -------------------------------------------------------
 @route("GET", "/scan")
 def scan_page(h):
+    """Door scanner — ADMIN ONLY.
+
+    This was public, which meant anyone who found the URL could admit tickets
+    (including their own). Redirect to login rather than 404, so you can get
+    straight in on the night.
+    """
+    if not require_admin(h, next_url="/scan"):
+        return
     h.send_html(T.scanner())
 
 
 @route("POST", "/api/scan")
 def api_scan(h):
+    # ADMIN ONLY. Hiding the scanner page is pointless if this endpoint is open —
+    # anyone could POST a code and admit themselves.
+    if not h.is_admin():
+        return h.send_json({"status": "unauthorised"}, 401)
     try:
         payload = json.loads(h.read_body().decode() or "{}")
     except json.JSONDecodeError:
@@ -592,6 +639,56 @@ def admin_test_email(h):
     })
 
 
+@route("POST", "/admin/tiers/add")
+def admin_tier_add(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    ttid = flat.get("ticket_type_id", "")
+    tt = db.get_ticket_type(ttid)
+    if not tt:
+        return h.send_html(T.layout("Error", "<h1>Unknown ticket type</h1>"), 404)
+
+    until = flat.get("until_date", "").strip()
+    maxq = flat.get("max_qty", "").strip()
+    until_ts = None
+    if until:
+        try:
+            t = time.strptime(until, "%Y-%m-%d")
+            # End of that day — "early bird until 1 Aug" means all of 1 Aug.
+            until_ts = int(time.mktime((t.tm_year, t.tm_mon, t.tm_mday,
+                                        23, 59, 59, 0, 0, -1)))
+        except ValueError:
+            until_ts = None
+    try:
+        price = int(round(float(flat.get("price", "0")) * 100))
+        db.add_price_tier(ttid, flat.get("name", ""), price,
+                          until_date=until_ts,
+                          max_qty=int(maxq) if maxq else None)
+    except ValueError as e:
+        return h.redirect(f"/admin/events/{tt['event_id']}?tier_err={urllib.parse.quote(str(e))}")
+    h.redirect(f"/admin/events/{tt['event_id']}")
+
+
+@route("POST", "/admin/tiers/delete")
+def admin_tier_delete(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    eid = flat.get("event_id", "")
+    db.delete_price_tier(flat.get("id", ""))
+    h.redirect(f"/admin/events/{eid}")
+
+
+@route("POST", "/admin/settings/display")
+def admin_save_display(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    db.set_setting("show_remaining", "1" if flat.get("show_remaining") else "0")
+    h.redirect("/admin/discounts?fee=saved")
+
+
 @route("POST", "/admin/settings/fee")
 def admin_save_fee(h):
     if not require_admin(h):
@@ -617,7 +714,8 @@ def admin_discounts(h):
         return
     h.send_html(T.admin_discounts(db.list_discounts(), db.list_events(),
                                   fee_cfg=db.fee_config(),
-                                  saved=(h.query.get("fee") == "saved")))
+                                  saved=(h.query.get("fee") == "saved"),
+                                  show_remaining=db.get_setting("show_remaining") == "1"))
 
 
 @route("POST", "/admin/discounts/new")
@@ -810,6 +908,9 @@ def admin_door(h, eid):
 @route("POST", "/api/admit-order")
 def api_admit_order(h):
     """Admit every remaining ticket on one booking — the whole party at once."""
+    # ADMIN ONLY — this admits a whole group in one call.
+    if not h.is_admin():
+        return h.send_json({"status": "unauthorised"}, 401)
     try:
         payload = json.loads(h.read_body().decode() or "{}")
     except json.JSONDecodeError:
@@ -831,29 +932,44 @@ def api_admit_order(h):
 # =====================================================================
 # Organiser dashboard
 # =====================================================================
-def require_admin(h):
+def require_admin(h, next_url=None):
     if not h.is_admin():
-        h.redirect("/admin/login")
+        # Send them back where they were going after login — on the night you want
+        # to land straight on the scanner, not the dashboard.
+        if next_url:
+            h.redirect(f"/admin/login?next={urllib.parse.quote(next_url)}")
+        else:
+            h.redirect("/admin/login")
         return False
     return True
 
 
 @route("GET", "/admin/login")
 def admin_login(h):
+    nxt = _safe_next(h.query.get("next", ""))
     if h.is_admin():
-        return h.redirect("/admin")
-    h.send_html(T.admin_login())
+        return h.redirect(nxt or "/admin")
+    h.send_html(T.admin_login(next_url=nxt))
 
 
 @route("POST", "/admin/login")
 def admin_login_post(h):
     flat, _ = h.form()
+    nxt = _safe_next(flat.get("next", ""))
     if flat.get("password", "") == ADMIN_PASSWORD:
         token = make_session(ADMIN_PASSWORD)
-        h.redirect("/admin", headers=[
+        h.redirect(nxt or "/admin", headers=[
             ("Set-Cookie", f"tf_session={token}; Path=/; HttpOnly; SameSite=Lax")])
     else:
-        h.send_html(T.admin_login(error="Incorrect password."), 401)
+        h.send_html(T.admin_login(error="Incorrect password.", next_url=nxt), 401)
+
+
+def _safe_next(url):
+    """Only allow same-site relative paths — never an off-site redirect."""
+    url = (url or "").strip()
+    if url.startswith("/") and not url.startswith("//"):
+        return url
+    return ""
 
 
 @route("GET", "/admin/logout")
@@ -935,9 +1051,12 @@ def admin_event(h, eid):
     event = db.get_event(eid)
     if not event:
         return h.send_html(T.layout("Not found", "<h1>Event not found</h1>"), 404)
-    h.send_html(T.admin_event(event, db.list_ticket_types(eid),
+    tts = _priced(db.list_ticket_types(eid))
+    tiers = {t["id"]: db.list_price_tiers(t["id"]) for t in tts}
+    h.send_html(T.admin_event(event, tts,
                               db.event_stats(eid), db.list_orders(eid),
-                              payments.is_live(), venues=db.known_venues()))
+                              payments.is_live(), venues=db.known_venues(),
+                              tiers_by_tt=tiers))
 
 
 @route("POST", "/admin/ticket-types/add")

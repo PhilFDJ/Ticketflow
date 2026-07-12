@@ -116,7 +116,13 @@ def run():
         code, tp, _ = get(op, f"/t/{tcode}")
         ok &= check("ticket page 200 + svg", code == 200 and "<svg" in tp)
 
-        # 4. Scan: first ok, second already, bogus invalid
+        # 4. Scan is ADMIN-ONLY. Prove it's locked, then log in and use it.
+        code_unauth, _, _ = post(op, "/api/scan", json.dumps({"code": tcode}),
+                                 json_body=True)
+        ok &= check("scan API rejects anonymous (401)", code_unauth == 401)
+
+        post(op, "/admin/login", {"password": "secretpw"})
+
         _, j1, _ = post(op, "/api/scan", json.dumps({"code": tcode}), json_body=True)
         _, j2, _ = post(op, "/api/scan", json.dumps({"code": tcode}), json_body=True)
         _, j3, _ = post(op, "/api/scan", json.dumps({"code": "TKT-BOGUS"}), json_body=True)
@@ -132,7 +138,8 @@ def run():
         #    (find remaining by hammering a tiny-stock type is overkill; just ensure
         #     oversell guard triggers with an absurd qty via direct order)
 
-        # 6. Admin auth
+        # 6. Admin auth. Log out first — the scan test above signed us in.
+        get(op, "/admin/logout")
         code, _, hdrs = get(op, "/admin")
         ok &= check("admin requires login (redirect)", code == 303 and "/admin/login" in hdrs.get("Location", ""))
         code, _, _ = post(op, "/admin/login", {"password": "wrong"})

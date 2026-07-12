@@ -48,12 +48,13 @@ def date_badge(ts):
 # Layout
 # ---------------------------------------------------------------------------
 def layout(title, body, active="", admin=False, embed=False):
-    nav = (
-        f'<a href="/" class="{ "active" if active=="home" else "" }">Events</a>'
-        f'<a href="/scan">Scan</a>'
-    )
+    nav = f'<a href="/" class="{ "active" if active=="home" else "" }">Events</a>'
     if admin:
-        nav += '<a href="/admin">Dashboard</a><a href="/admin/logout">Sign out</a>'
+        # Scan is an ORGANISER tool. Showing it publicly invited people to open the
+        # scanner and admit their own tickets.
+        nav += ('<a href="/scan">Scan</a>'
+                '<a href="/admin">Dashboard</a>'
+                '<a href="/admin/logout">Sign out</a>')
     else:
         nav += '<a href="/admin">Organiser</a>'
 
@@ -193,7 +194,8 @@ def _maps_link(event):
     return f'<p class="venue-addr">{_nl2br(addr)}</p>'
 
 
-def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None):
+def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None,
+                 show_remaining=False, price_notice=None):
     fee_cfg = fee_cfg or {"percent": 0, "fixed": 0, "label": "Booking fee",
                           "enabled": False}
     d = fmt_date(event["starts_at"])
@@ -212,22 +214,65 @@ def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None):
         remaining = t["quantity"] - t["sold"]
         avail = remaining > 0
         any_available = any_available or avail
+
+        # The tier price, not the base price — and the SAME function checkout uses,
+        # so what's displayed is what's charged.
+        price, tier_name = (t.get("_price"), t.get("_tier")) if "_price" in t else (t["price"], None)
+        tier_info = t.get("_tier_info")
+
         control = (f"""
-          <div class="stepper" data-price="{t['price']}">
+          <div class="stepper" data-price="{price}">
             <button type="button" onclick="step('{t['id']}',-1)">−</button>
             <input id="q_{t['id']}" name="qty_{t['id']}" value="0" readonly>
             <button type="button" onclick="step('{t['id']}',1)" data-max="{remaining}">+</button>
-          </div>""" if avail else '<span class="pill bad">Sold out</span>')
+          </div>
+          <input type="hidden" name="quoted_{t['id']}" value="{price}">""" if avail
+          else '<span class="pill bad">Sold out</span>')
+        # The "N left" count is hidden by default — it tells buyers how well (or
+        # badly) an event is selling. The stepper's data-max still enforces the real
+        # limit, so nothing can be oversold; this only affects what's displayed.
+        # A low-stock nudge is shown instead, which creates urgency without
+        # advertising a quiet night.
+        if show_remaining:
+            stock = f" · {remaining} left"
+        elif remaining <= 10:
+            stock = f' · <span class="lowstock">Only {remaining} left</span>'
+        else:
+            stock = ""
+
+        # Honest urgency: driven by the real tier rules, not a fake countdown.
+        nudge = ""
+        if tier_info and avail:
+            bits = []
+            if tier_info["left_in_tier"] is not None and tier_info["left_in_tier"] <= 25:
+                bits.append(f"{tier_info['left_in_tier']} left at this price")
+            if tier_info["until_date"]:
+                bits.append("until " + time.strftime(
+                    "%d %b", time.localtime(int(tier_info["until_date"]))))
+            label = esc(tier_info["name"])
+            nudge = (f'<div class="tiernote">{label} — {esc(" · ".join(bits))}</div>'
+                     if bits else f'<div class="tiernote">{label}</div>')
+
         rows.append(f"""
           <div class="tt-row">
             <div>
               <h3>{esc(t['name'])}</h3>
-              <div class="muted small">{money(t['price'], event['currency'])}
-                · {remaining} left</div>
+              <div class="muted small">{money(price, event['currency'])}{stock}</div>
+              {nudge}
             </div>
             <div>{control}</div>
           </div>""")
     err = flash("err", error) if error else ""
+    if price_notice:
+        lines = "".join(
+            f"<li><b>{esc(c['name'])}</b>: {money(c['was'])} → "
+            f"<b>{money(c['now'])}</b>"
+            + (f" ({esc(c['tier'])})" if c.get("tier") else "") + "</li>"
+            for c in price_notice)
+        err = (f'<div class="flash err"><b>The price changed while you were '
+               f'deciding.</b><ul style="margin:8px 0 0 18px">{lines}</ul>'
+               f'<div class="mt2">Your tickets are still reserved at the new price — '
+               f'just hit Checkout again to confirm.</div></div>') + err
     buy = f"""
       <form method="post" action="/checkout" id="buyform">
         <input type="hidden" name="event_id" value="{esc(event['id'])}">
@@ -655,7 +700,7 @@ def scanner():
       loop();
     }
     </script>"""
-    return layout("Scanner", body, active="scan")
+    return layout("Scanner", body, active="scan", admin=True)
 
 
 # ---------------------------------------------------------------------------
@@ -766,7 +811,8 @@ def admin_door(event, parties):
     return layout("On the door", body, admin=True)
 
 
-def admin_discounts(discounts, events, error=None, fee_cfg=None, saved=False):
+def admin_discounts(discounts, events, error=None, fee_cfg=None, saved=False,
+                    show_remaining=False):
     fee_cfg = fee_cfg or {"percent": 0, "fixed": 0, "label": "Booking fee",
                           "enabled": False}
     rows = []
@@ -866,6 +912,21 @@ def admin_discounts(discounts, events, error=None, fee_cfg=None, saved=False):
               + money(ex_stripe - ex_fee) + '.</span>' if fee_cfg["enabled"]
          else 'With no fee, you absorb all of it.'}
       </div>
+    </div></div>
+
+    <div class="card mt3"><div class="body">
+      <h2 class="mt0">What buyers see</h2>
+      <form method="post" action="/admin/settings/display">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+          <input type="checkbox" name="show_remaining" value="1"
+                 style="width:auto" {'checked' if show_remaining else ''}>
+          <span>Show how many tickets are left</span>
+        </label>
+        <p class="muted small mt1">Off by default — it tells people how well (or badly)
+          an event is selling. When it's off, buyers still see "Only N left" once you're
+          down to the last 10, which creates urgency without advertising a quiet night.</p>
+        <div class="mt2"><button class="btn sec" type="submit">Save</button></div>
+      </form>
     </div></div>
 
     <h2 class="mt3">Discount codes</h2>
@@ -1060,8 +1121,10 @@ def door_sheet(event, parties):
 </body></html>"""
 
 
-def admin_login(error=None):
+def admin_login(error=None, next_url=""):
     err = flash("err", error) if error else ""
+    nxt = (f'<input type="hidden" name="next" value="{esc(next_url)}">'
+           if next_url else "")
     return layout("Organiser sign in", f"""
     <div class="narrow" style="margin:40px auto 0">
       <div class="card"><div class="body">
@@ -1069,6 +1132,7 @@ def admin_login(error=None):
         <p class="muted">Manage your events, tickets and door check-ins.</p>
         {err}
         <form method="post" action="/admin/login">
+          {nxt}
           <label>Password</label>
           <input name="password" type="password" autofocus required>
           <button class="btn full mt3" type="submit">Sign in</button>
@@ -1302,21 +1366,72 @@ def _cover_preview(event):
     )
 
 
-def admin_event(event, ticket_types, stats, orders, live_mode, error=None, venues=None):
+def admin_event(event, ticket_types, stats, orders, live_mode, error=None, venues=None,
+                tiers_by_tt=None, avail_tiers=True):
     venues = venues or []
+    tiers_by_tt = tiers_by_tt or {}
     e_venue_options = "".join(
         f'<option value="{esc(v["venue"])}"></option>' for v in venues)
     e_venue_addrs = json.dumps({v["venue"]: v["address"] for v in venues})
     tt_rows = []
     for t in ticket_types:
+        tiers = tiers_by_tt.get(t["id"], []) if tiers_by_tt else []
+        cur_price = t.get("_price", t["price"])
+        cur_tier = t.get("_tier")
+
+        price_cell = money(cur_price, event["currency"])
+        if cur_tier:
+            price_cell += f'<br><span class="muted small">{esc(cur_tier)} (base {money(t["price"], event["currency"])})</span>'
+
         tt_rows.append(f"""
-        <tr><td>{esc(t['name'])}</td><td>{money(t['price'], event['currency'])}</td>
+        <tr><td>{esc(t['name'])}</td><td>{price_cell}</td>
           <td>{t['sold']} / {t['quantity']}</td>
           <td><form method="post" action="/admin/ticket-types/delete" style="margin:0"
                 onsubmit="return confirm('Delete this ticket type?')">
             <input type="hidden" name="id" value="{esc(t['id'])}">
             <input type="hidden" name="event_id" value="{esc(event['id'])}">
             <button class="btn ghost sm" type="submit">Remove</button></form></td></tr>""")
+
+        # Tier rows sit under their ticket type.
+        for tr in tiers:
+            rule = []
+            if tr["until_date"]:
+                rule.append("until " + time.strftime("%d %b %Y",
+                            time.localtime(int(tr["until_date"]))))
+            if tr["max_qty"] is not None:
+                rule.append(f"first {tr['max_qty']} sold")
+            active = (cur_tier == tr["name"])
+            tt_rows.append(f"""
+            <tr class="tierrow">
+              <td class="muted small" style="padding-left:24px">
+                ↳ {esc(tr['name'])}
+                {'<span class="pill ok" style="margin-left:6px">Active</span>' if active else ''}</td>
+              <td class="muted small">{money(tr['price'], event['currency'])}</td>
+              <td class="muted small">{esc(' · '.join(rule)) or '—'}</td>
+              <td><form method="post" action="/admin/tiers/delete" style="margin:0">
+                <input type="hidden" name="id" value="{esc(tr['id'])}">
+                <input type="hidden" name="event_id" value="{esc(event['id'])}">
+                <button class="btn ghost sm" type="submit">×</button></form></td>
+            </tr>""")
+
+        if avail_tiers:
+            tt_rows.append(f"""
+            <tr class="tierrow">
+              <td colspan="4" style="padding-left:24px">
+                <form method="post" action="/admin/tiers/add" class="row"
+                      style="gap:6px;align-items:center;margin:0">
+                  <input type="hidden" name="ticket_type_id" value="{esc(t['id'])}">
+                  <div><input name="name" placeholder="Early bird" required></div>
+                  <div><input name="price" type="number" min="0" step="0.01"
+                              placeholder="Price" required></div>
+                  <div><input name="until_date" type="date" title="Valid until this date"></div>
+                  <div><input name="max_qty" type="number" min="1"
+                              placeholder="or first N" title="Valid for the first N sold"></div>
+                  <div style="flex:0 0 auto">
+                    <button class="btn ghost sm" type="submit">+ Tier</button></div>
+                </form>
+              </td>
+            </tr>""")
     order_rows = []
     for o in orders[:50]:
         order_rows.append(f"""
@@ -1401,8 +1516,11 @@ def admin_event(event, ticket_types, stats, orders, live_mode, error=None, venue
     </div></div>
 
     <div class="card mt3"><div class="body">
-      <h2 class="mt0">Ticket types</h2>
-      <table><thead><tr><th>Name</th><th>Price</th><th>Sold</th><th></th></tr></thead>
+      <h2 class="mt0">Ticket types &amp; pricing</h2>
+      <p class="muted small">Add a <b>tier</b> to change the price by date ("early bird
+        until 1 Aug") or by quantity ("first 50 at £6"). Tiers apply in order — the
+        first one still valid wins. No tiers = the base price always applies.</p>
+      <table><thead><tr><th>Name</th><th>Price</th><th>Sold / Rule</th><th></th></tr></thead>
       <tbody>{''.join(tt_rows) or '<tr><td colspan=4 class=muted>None yet</td></tr>'}</tbody></table>
       <form method="post" action="/admin/ticket-types/add" class="row mt3">
         <input type="hidden" name="event_id" value="{esc(event['id'])}">

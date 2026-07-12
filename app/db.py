@@ -101,6 +101,20 @@ def _migrate(conn):
       created_at   INTEGER NOT NULL
     )""")
 
+    # Price tiers: a ticket type can change price by DATE ("early bird until 1 Aug")
+    # or by QUANTITY ("first 50 at £6"). Both can apply; see effective_price().
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS price_tiers (
+      id             TEXT PRIMARY KEY,
+      ticket_type_id TEXT NOT NULL,
+      name           TEXT NOT NULL,        -- "Early bird", "Tier 1"...
+      price          INTEGER NOT NULL,     -- pence
+      until_date     INTEGER,              -- valid while now() < this. NULL = no date rule
+      max_qty        INTEGER,              -- valid while sold < this.  NULL = no qty rule
+      sort_order     INTEGER NOT NULL DEFAULT 0,
+      created_at     INTEGER NOT NULL
+    )""")
+
     # Site settings (booking fee, etc). One row, keyed by name.
     conn.execute("""
     CREATE TABLE IF NOT EXISTS settings (
@@ -266,14 +280,27 @@ def delete_ticket_type(tid):
 # ---------------------------------------------------------------------------
 # Orders & tickets
 # ---------------------------------------------------------------------------
+class PriceChanged(Exception):
+    """A price tier moved on between the page loading and checkout.
+
+    We refuse the order rather than charging a price the customer never agreed to.
+    The handler shows them the new price and lets them confirm.
+    """
+    def __init__(self, changes):
+        self.changes = changes
+        super().__init__("Price changed")
+
+
 def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
-                 currency="GBP", buyer_phone="", discount_code=""):
+                 currency="GBP", buyer_phone="", discount_code="",
+                 quoted_prices=None):
     """items: list of (ticket_type_id, qty). Validates stock. Returns order id.
 
     Raises ValueError if a ticket type is sold out / lacks stock, or if a supplied
     discount code is invalid.
     """
     oid = new_id("ord")
+    price_changes = []          # tiers that moved on while they were deciding
     with cursor() as conn:
         subtotal = 0
         resolved = []
@@ -287,10 +314,30 @@ def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
             remaining = tt["quantity"] - tt["sold"]
             if qty > remaining:
                 raise ValueError(f"Only {remaining} left for {tt['name']}")
-            subtotal += tt["price"] * qty
-            resolved.append((tt_id, qty, tt["price"]))
+
+            # Price NOW, not the price on the page they loaded ten minutes ago.
+            # A tier may have sold out or expired in between; we charge the real
+            # current price and tell them (see quoted_price below).
+            unit, tier_name = effective_price(dict(tt))
+            if quoted_prices and str(tt_id) in quoted_prices:
+                try:
+                    was = int(quoted_prices[str(tt_id)])
+                except (TypeError, ValueError):
+                    was = unit
+                if was != unit:
+                    price_changes.append({
+                        "name": tt["name"], "was": was, "now": unit,
+                        "tier": tier_name,
+                    })
+
+            subtotal += unit * qty
+            resolved.append((tt_id, qty, unit))
         if not resolved:
             raise ValueError("No tickets selected")
+
+    # If the price moved, don't silently charge more — stop and tell them.
+    if price_changes:
+        raise PriceChanged(price_changes)
 
     # Validate the code against the real subtotal. Outside the transaction above
     # because validate_discount opens its own cursor.
@@ -706,6 +753,98 @@ def calc_booking_fee(amount):
         return 0
     fee = int(round(amount * cfg["percent"] / 100.0)) + cfg["fixed"]
     return max(0, fee)
+
+
+# ---------------------------------------------------------------------------
+# Price tiers (early bird / quantity-based pricing)
+# ---------------------------------------------------------------------------
+def add_price_tier(ticket_type_id, name, price, until_date=None, max_qty=None):
+    if not name.strip():
+        raise ValueError("Give the tier a name.")
+    if price < 0:
+        raise ValueError("Price can't be negative.")
+    if until_date is None and max_qty is None:
+        raise ValueError("A tier needs a date limit, a quantity limit, or both.")
+    if max_qty is not None and max_qty < 1:
+        raise ValueError("Quantity limit must be at least 1.")
+    tid = new_id("tier")
+    with cursor() as conn:
+        n = conn.execute("SELECT COUNT(*) c FROM price_tiers WHERE ticket_type_id = ?",
+                         (ticket_type_id,)).fetchone()["c"]
+        conn.execute(
+            "INSERT INTO price_tiers (id,ticket_type_id,name,price,until_date,"
+            "max_qty,sort_order,created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (tid, ticket_type_id, name.strip(), price, until_date, max_qty, n, now()))
+    return tid
+
+
+def list_price_tiers(ticket_type_id):
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT * FROM price_tiers WHERE ticket_type_id = ? "
+            "ORDER BY sort_order, created_at", (ticket_type_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_price_tier(tid):
+    with cursor() as conn:
+        conn.execute("DELETE FROM price_tiers WHERE id = ?", (tid,))
+
+
+def effective_price(tt):
+    """THE price for a ticket type right now, and why.
+
+    This is the single source of truth — the event page, the checkout and the
+    Stripe charge all call it. If display and checkout used different logic they
+    would drift, and someone would be charged a price they were never shown.
+
+    A tier applies while BOTH its conditions hold (a tier with only one condition
+    ignores the other). Tiers are checked in order; the first that still applies
+    wins. If none do, the ticket type's base price is used.
+
+    Returns (price_pence, tier_name_or_None).
+    """
+    tiers = list_price_tiers(tt["id"])
+    if not tiers:
+        return tt["price"], None
+
+    sold = tt["sold"]
+    t_now = now()
+    for tier in tiers:
+        # Date rule: still within the window?
+        if tier["until_date"] is not None and t_now >= tier["until_date"]:
+            continue
+        # Quantity rule: still tickets left in this tier?
+        if tier["max_qty"] is not None and sold >= tier["max_qty"]:
+            continue
+        return tier["price"], tier["name"]
+
+    return tt["price"], None
+
+
+def price_tier_summary(tt):
+    """What's coming next, for an honest 'price rises to X' nudge on the page."""
+    tiers = list_price_tiers(tt["id"])
+    if not tiers:
+        return None
+    cur_price, cur_name = effective_price(tt)
+    sold = tt["sold"]
+    t_now = now()
+
+    for tier in tiers:
+        if tier["until_date"] is not None and t_now >= tier["until_date"]:
+            continue
+        if tier["max_qty"] is not None and sold >= tier["max_qty"]:
+            continue
+        # This is the active tier — say what makes it end.
+        left = None
+        if tier["max_qty"] is not None:
+            left = max(0, tier["max_qty"] - sold)
+        return {
+            "name": tier["name"], "price": cur_price,
+            "until_date": tier["until_date"], "left_in_tier": left,
+        }
+    return None
 
 
 def tickets_for_order(oid):
