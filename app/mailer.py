@@ -79,10 +79,29 @@ def send_verbose(to_email: str, subject: str, html: str, text: str = ""):
         # Resend returns a JSON body explaining exactly what's wrong — usually an
         # unverified sending domain or a bad API key. Surface it verbatim.
         try:
-            detail = e.read().decode()[:300]
+            detail = e.read().decode()[:400]
         except Exception:
             detail = ""
-        msg = f"HTTP {e.code} from mail provider. {detail}"
+
+        # Cloudflare sits in front of Resend and blocks unrecognised HTTP clients
+        # with a 403 + "error code: 1010" before the request reaches Resend at all.
+        if "1010" in detail or "Cloudflare" in detail or "cloudflare" in detail:
+            msg = ("Blocked by Cloudflare before reaching Resend (error 1010). "
+                   "This is a bad User-Agent, not a key or domain problem.")
+        elif e.code == 401:
+            msg = ("Resend rejected the API key (401). Check RESEND_API_KEY in "
+                   "Render is correct and hasn't been revoked.")
+        elif e.code == 403:
+            msg = (f"Resend refused the request (403). Usually the sending domain "
+                   f"isn't verified. Sending from: {from_address()}. "
+                   f"Detail: {detail[:150]}")
+        elif e.code == 422:
+            msg = (f"Resend rejected the message (422) — often an unverified "
+                   f"'from' domain. Sending from: {from_address()}. "
+                   f"Detail: {detail[:150]}")
+        else:
+            msg = f"HTTP {e.code} from mail provider. {detail[:200]}"
+
         print(f"[mailer] send failed to {to_email}: {msg}")
         return False, msg
     except Exception as e:  # noqa: BLE001 - deliberately swallow everything
@@ -108,7 +127,14 @@ def _send_resend(to_email, subject, html, text) -> bool:
         headers={
             "Authorization": f"Bearer {_resend_key()}",
             "Content-Type": "application/json",
+            # Resend sits behind Cloudflare, which blocks Python's default
+            # "Python-urllib/3.x" agent outright — it returns HTTP 403 with
+            # Cloudflare error 1010 before the request ever reaches Resend.
+            # Identify ourselves as a normal API client instead.
+            "User-Agent": "MayhemBingoTickets/1.0 (+https://mayhembingo.co.uk)",
+            "Accept": "application/json",
         },
+        method="POST",
     )
     with urllib.request.urlopen(req, timeout=20) as resp:
         ok = 200 <= resp.status < 300
