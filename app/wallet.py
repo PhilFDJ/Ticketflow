@@ -149,6 +149,8 @@ def build_pass(ticket, event, base_url) -> bytes:
             ],
             "backFields": [
                 {"key": "code", "label": "Ticket code", "value": serial},
+                {"key": "address", "label": "Venue",
+                 "value": _venue_block(event)},
                 {"key": "link", "label": "View ticket",
                  "value": f"{base_url}/t/{serial}"},
                 {"key": "terms", "label": "Info",
@@ -175,6 +177,19 @@ def build_pass(ticket, event, base_url) -> bytes:
         z.writestr("manifest.json", manifest_bytes)
         z.writestr("signature", signature)
     return buf.getvalue()
+
+
+def _venue_block(event):
+    """Venue name + address for the back of the pass. Apple Wallet linkifies an
+    address automatically, so tapping it opens Apple Maps."""
+    name = (event.get("venue") or "").strip()
+    addr = ""
+    try:
+        addr = (event["address"] or "").strip()
+    except (KeyError, TypeError):
+        addr = ""
+    parts = [p for p in (name, addr) if p]
+    return "\n".join(parts) if parts else "See the event page for details."
 
 
 def _iso(ts):

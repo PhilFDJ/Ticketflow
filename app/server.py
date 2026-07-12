@@ -30,25 +30,65 @@ UPLOAD_DIR = os.environ.get(
     os.path.join(os.path.dirname(db.DB_PATH), "uploads"),
 )
 ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-MAX_IMAGE_BYTES = 6 * 1024 * 1024  # 6MB — plenty for a poster, stops abuse
+MAX_IMAGE_BYTES = 8 * 1024 * 1024   # 8MB upload cap — a phone photo or Canva export
+MAX_IMAGE_EDGE = 1400               # px: posters are downscaled to this longest edge
 
 
 def save_upload(field_files, field="image_file"):
-    """Save an uploaded image and return its public URL, or "" if none/invalid."""
+    """Save an uploaded poster and return its public URL.
+
+    Returns "" if no file was given. Raises ValueError with a readable message if
+    the file is unusable — the caller shows it, rather than the upload failing
+    silently and the event quietly saving with no picture.
+
+    Posters are downscaled: a full-size Canva export can be 4000px wide and
+    several MB, which every visitor would then download just to see a card.
+    """
     got = (field_files or {}).get(field)
     if not got:
         return ""
     fname, data = got
     ext = os.path.splitext(fname)[1].lower()
     if ext not in ALLOWED_IMAGE_EXT:
-        return ""
+        raise ValueError(
+            f"'{fname}' isn't an image we can use. "
+            f"Use a JPG, PNG or WEBP.")
     if len(data) > MAX_IMAGE_BYTES:
-        return ""
+        mb = len(data) / (1024 * 1024)
+        raise ValueError(
+            f"That image is {mb:.1f}MB — too big (max 8MB). "
+            f"Export it smaller, or save as a JPG.")
+
+    data, ext = _shrink_image(data, ext)
+
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     safe = f"{new_id('img')}{ext}"
     with open(os.path.join(UPLOAD_DIR, safe), "wb") as f:
         f.write(data)
     return f"/uploads/{safe}"
+
+
+def _shrink_image(data, ext):
+    """Downscale a big poster so pages stay fast on a phone.
+
+    Pillow isn't installed on the server (the app installs nothing on deploy), so
+    if it's unavailable we keep the original bytes — the size cap above still
+    protects us from anything absurd.
+    """
+    try:
+        from PIL import Image
+        import io as _io
+        im = Image.open(_io.BytesIO(data))
+        if max(im.size) <= MAX_IMAGE_EDGE:
+            return data, ext
+        im.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE), Image.LANCZOS)
+        out = _io.BytesIO()
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGB")
+        im.save(out, format="JPEG", quality=86, optimize=True)
+        return out.getvalue(), ".jpg"
+    except Exception:
+        return data, ext
 
 
 def qr_svg(code):
@@ -651,7 +691,10 @@ def admin_create_event(h):
     except ValueError:
         return h.send_html(T.admin_new_event(error="Please provide a valid date & time."), 400)
     # Cover image: an uploaded file wins; otherwise an external URL if given.
-    image = save_upload(getattr(h, "files", {}), "image_file") or flat.get("image", "").strip()
+    try:
+        image = save_upload(getattr(h, "files", {}), "image_file") or flat.get("image", "").strip()
+    except ValueError as e:
+        return h.send_html(T.admin_new_event(error=str(e)), 400)
 
     eid = db.create_event(
         title=title, description=flat.get("description", ""),
@@ -660,6 +703,8 @@ def admin_create_event(h):
         currency=flat.get("currency", "GBP"), published=True)
     if image:
         db.update_event(eid, image=image)
+    if flat.get("address", "").strip():
+        db.update_event(eid, address=flat["address"].strip())
     # ticket types (indexed fields tt_name_N / tt_price_N / tt_qty_N)
     idxs = sorted({int(k.split("_")[-1]) for k in flat if k.startswith("tt_name_")})
     for i in idxs:
@@ -722,7 +767,7 @@ def admin_edit_event(h):
         return h.send_html(T.layout("Error", "<h1>Unknown event</h1>"), 404)
 
     fields = {}
-    for key in ("title", "venue", "description"):
+    for key in ("title", "venue", "description", "address"):
         if key in flat:
             fields[key] = flat.get(key, "").strip()
     if flat.get("image_url"):
@@ -737,7 +782,15 @@ def admin_edit_event(h):
             pass
 
     # New uploaded image wins; else a pasted URL; else leave the existing one alone.
-    new_image = save_upload(getattr(h, "files", {}), "image_file")
+    try:
+        new_image = save_upload(getattr(h, "files", {}), "image_file")
+    except ValueError as e:
+        event = db.get_event(eid)
+        tts = db.list_ticket_types(eid)
+        stats = db.event_stats(eid)
+        orders = db.list_orders(eid)
+        return h.send_html(T.admin_event(event, tts, stats, orders,
+                                         payments.is_live(), error=str(e)), 400)
     if not new_image and flat.get("image", "").strip():
         new_image = flat["image"].strip()
     if new_image:

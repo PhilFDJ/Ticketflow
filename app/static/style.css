@@ -233,3 +233,17 @@ footer.site{border-top:1px solid var(--line);color:var(--muted);font-size:13px;p
 .applewallet .aw-text{display:flex;flex-direction:column;line-height:1.1;text-align:left}
 .applewallet .aw-text small{font-size:10px;opacity:.75;letter-spacing:.02em}
 .applewallet .aw-text b{font-size:15px;font-weight:600}
+
+/* Venue address + directions link */
+.venue-addr{color:var(--muted);font-size:14px;margin:-4px 0 14px;line-height:1.5}
+.maplink{display:inline-block;margin-top:4px;color:var(--brand-2);font-weight:600;
+  font-size:14px;text-decoration:none}
+.maplink:hover{text-decoration:underline}
+
+/* Full venue address on tickets. Must survive printing — a printed ticket with
+   no address is half the point of printing it. */
+.ticket-addr{white-space:pre-line;line-height:1.45;margin-top:2px}
+@media print{
+  .ticket-addr{color:#000 !important;font-size:11px !important}
+  .venue-addr{color:#000 !important}
+}

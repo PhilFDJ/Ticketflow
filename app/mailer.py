@@ -206,7 +206,7 @@ def ticket_email_html(event, tickets, base_url, qr_svgs=None):
     <h1 style="font-size:22px;margin:0 0 6px;color:#0f1720">You're in! 🎉</h1>
     <p style="margin:0 0 4px;font-size:15px"><b>{_e(event['title'])}</b></p>
     <p style="margin:0 0 18px;color:#5a6b7b;font-size:14px">
-      {_e(event.get('venue') or '')}
+      {_e(event.get('venue') or '')}{_venue_addr_html(event)}
     </p>
     <p style="font-size:14px;margin:0 0 18px">
       Here {'are your tickets' if len(tickets) != 1 else 'is your ticket'} — tap to open,
@@ -225,13 +225,30 @@ def ticket_email_text(event, tickets, base_url):
     lines = [f"You're in! — {event['title']}", ""]
     if event.get("venue"):
         lines.append(event["venue"])
-        lines.append("")
+    try:
+        if event["address"]:
+            lines.append(event["address"])
+    except (KeyError, TypeError):
+        pass
+    lines.append("")
     lines.append("Your tickets:")
     for t in tickets:
         lines.append(f"  {t['ticket_name']}: {base_url}/t/{t['code']}")
         lines.append(f"    code: {t['code']}")
     lines += ["", "Show the QR at the door. Keep this email — it's your ticket."]
     return "\n".join(lines)
+
+
+def _venue_addr_html(event):
+    """The venue's full address in the ticket email — so it's there when someone
+    checks their ticket on the way. No directions link; just the address."""
+    try:
+        addr = (event["address"] or "").strip()
+    except (KeyError, TypeError):
+        return ""
+    if not addr:
+        return ""
+    return "<br>" + _e(addr).replace("\n", "<br>")
 
 
 def _e(s):

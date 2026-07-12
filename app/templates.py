@@ -1,5 +1,6 @@
 """HTML rendering for Mayhem Bingo tickets. Pure string templating, stdlib only."""
 import html
+import urllib.parse
 import time
 
 CURRENCY_SYMBOL = {"GBP": "£", "USD": "$", "EUR": "€"}
@@ -171,6 +172,18 @@ def home(events, ticket_types_by_event, live_mode, embed=False):
     """, active="home", embed=embed)
 
 
+def _maps_link(event):
+    """The venue's full address, plainly shown.
+
+    No directions button — people just need to know where the place is; their
+    phone's maps app is a copy-paste away if they want it.
+    """
+    addr = (event["address"] or "").strip() if "address" in event.keys() else ""
+    if not addr:
+        return ""
+    return f'<p class="venue-addr">{_nl2br(addr)}</p>'
+
+
 def event_detail(event, ticket_types, live_mode, error=None):
     d = fmt_date(event["starts_at"])
     accent = event["image_url"] if (event["image_url"] or "").startswith("#") else "#4f46e5"
@@ -228,6 +241,7 @@ def event_detail(event, ticket_types, live_mode, error=None):
         <span class="pill">{esc(d)}</span>
         <h1 class="mt2">{esc(event['title'])}</h1>
         <p class="lead">{esc(event['venue'])}</p>
+        {_maps_link(event)}
         <p>{_nl2br(event['description'])}</p>
       </div>
     </div>
@@ -300,6 +314,7 @@ def success(order, event, tickets, qr_svgs, emailed=False, email_on=False):
           <div class="muted small">{esc(event['title'])}</div>
           <div class="muted small">{esc(fmt_date(event['starts_at']))}</div>
           <div class="muted small">{esc(event.get('venue') or '')}</div>
+          {f'<div class="muted small ticket-addr">{_nl2br(event["address"])}</div>' if ("address" in event.keys() and event["address"]) else ''}
           <div class="qr qr-sm">{qr_svgs[t['code']]}</div>
           <div class="code">{esc(t['code'])}</div>
           <a class="btn ghost sm no-print" href="/t/{esc(t['code'])}">Open full ticket</a>
@@ -328,6 +343,18 @@ def success(order, event, tickets, qr_svgs, emailed=False, email_on=False):
       {''.join(tks)}
       <div class="center mt3 no-print"><a href="/" class="muted">← Back to events</a></div>
     </div>""")
+
+
+def _ticket_addr(t):
+    """The venue's full address on the ticket itself — so someone holding the
+    ticket (on screen or printed) knows exactly where to go."""
+    try:
+        addr = (t["event_address"] or "").strip()
+    except (KeyError, TypeError, IndexError):
+        addr = ""
+    if not addr:
+        return ""
+    return f'<div class="muted small ticket-addr">{_nl2br(addr)}</div>'
 
 
 def ticket_page(t, qr_svg, wallet_on=False):
@@ -359,6 +386,7 @@ def ticket_page(t, qr_svg, wallet_on=False):
         <h2 class="mt2 mt0">{esc(t['event_title'])}</h2>
         <div class="muted small">{esc(fmt_date(t['event_starts_at']))}</div>
         <div class="muted small">{esc(t['event_venue'])}</div>
+        {_ticket_addr(t)}
         <div class="mt2"><span class="pill">{esc(t['ticket_name'])}</span></div>
         <span class="notch l"></span><span class="notch r"></span>
       </div>
@@ -820,6 +848,8 @@ def admin_new_event(error=None):
         <input name="title" required placeholder="Friday Night Live">
         <label>Venue</label>
         <input name="venue" placeholder="The Brickyard, Manchester">
+        <label>Venue address <span class="muted small">(shown on the ticket, links to maps)</span></label>
+        <input name="address" placeholder="12 High Street, Huddersfield, HD1 2AB">
         <label>Description</label>
         <textarea name="description" placeholder="Tell people what to expect…"></textarea>
         <div class="row">
@@ -832,8 +862,10 @@ def admin_new_event(error=None):
               <option value="EUR">EUR €</option>
             </select></div>
         </div>
-        <label>Event image <span class="muted small">(optional — a poster or photo)</span></label>
+        <label>Event image <span class="muted small">(optional — a poster or advert)</span></label>
         <input name="image_file" type="file" accept="image/*">
+        <p class="muted small mt1">Portrait works best — around <b>800&times;1200</b> (2:3), like a poster.
+          Max 8MB; anything bigger than 1400px is shrunk automatically so pages stay fast on a phone.</p>
         <label class="mt2">…or paste an image URL</label>
         <input name="image" type="url" placeholder="https://…  (leave blank if uploading a file)">
         <label class="mt2">Accent colour <span class="muted small">(used if there's no image)</span></label>
@@ -872,7 +904,7 @@ def _cover_preview(event):
     )
 
 
-def admin_event(event, ticket_types, stats, orders, live_mode):
+def admin_event(event, ticket_types, stats, orders, live_mode, error=None):
     tt_rows = []
     for t in ticket_types:
         tt_rows.append(f"""
@@ -914,6 +946,8 @@ def admin_event(event, ticket_types, stats, orders, live_mode):
       <div class="stat"><div class="n">{stats['scanned']}</div><div class="l">Checked in</div></div>
     </div>
 
+    {flash("err", error) if error else ""}
+
     <div class="card mt3"><div class="body">
       <h2 class="mt0">Event details</h2>
       <form method="post" action="/admin/events/edit" enctype="multipart/form-data">
@@ -923,6 +957,9 @@ def admin_event(event, ticket_types, stats, orders, live_mode):
         <div class="row">
           <div><label>Venue</label>
             <input name="venue" value="{esc(event['venue'])}"></div>
+          <div><label>Venue address</label>
+            <input name="address" value="{esc(event['address'] if 'address' in event.keys() else '')}"
+                   placeholder="12 High Street, Huddersfield, HD1 2AB"></div>
           <div><label>Date &amp; time</label>
             <input name="starts_at" type="datetime-local" value="{_dtlocal(event['starts_at'])}"></div>
         </div>

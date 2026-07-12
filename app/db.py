@@ -81,6 +81,10 @@ def _migrate(conn):
         # A real cover image (uploaded file path or external URL). The original
         # `image_url` column was misnamed — it only ever held a hex accent colour.
         conn.execute("ALTER TABLE events ADD COLUMN image TEXT NOT NULL DEFAULT ''")
+    if "address" not in ecols:
+        # Full venue address, so punters can get directions. `venue` is just the
+        # name ("The Social Club"); this is the postal address.
+        conn.execute("ALTER TABLE events ADD COLUMN address TEXT NOT NULL DEFAULT ''")
 
 
 def connect():
@@ -386,7 +390,8 @@ def tickets_for_order(oid):
     with cursor() as conn:
         rows = conn.execute(
             "SELECT t.*, tt.name AS ticket_name, e.title AS event_title, "
-            "e.starts_at AS event_starts_at, e.venue AS event_venue "
+            "e.starts_at AS event_starts_at, e.venue AS event_venue, "
+            "e.address AS event_address "
             "FROM tickets t "
             "JOIN ticket_types tt ON tt.id = t.ticket_type_id "
             "JOIN events e ON e.id = t.event_id "
@@ -399,7 +404,8 @@ def get_ticket_by_code(code):
         row = conn.execute(
             "SELECT t.*, tt.name AS ticket_name, tt.price AS price, "
             "e.title AS event_title, e.starts_at AS event_starts_at, "
-            "e.venue AS event_venue, o.buyer_name AS buyer_name "
+            "e.venue AS event_venue, e.address AS event_address, "
+            "o.buyer_name AS buyer_name "
             "FROM tickets t "
             "JOIN ticket_types tt ON tt.id = t.ticket_type_id "
             "JOIN events e ON e.id = t.event_id "
