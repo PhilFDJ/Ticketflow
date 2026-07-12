@@ -353,7 +353,7 @@ def event_detail(h, eid):
         return h.send_html(T.layout("Not found", "<h1>Event not found</h1>"), 404)
     tts = db.list_ticket_types(eid)
     err = "Payment cancelled — your tickets weren't purchased." if h.query.get("cancelled") else None
-    h.send_html(T.event_detail(event, tts, payments.is_live(), error=err))
+    h.send_html(T.event_detail(event, tts, payments.is_live(), error=err, fee_cfg=db.fee_config()))
 
 
 @route("POST", "/checkout")
@@ -375,14 +375,15 @@ def checkout(h):
     dcode = flat.get("discount_code", "").strip()
     if not items or not name or not email or not phone:
         return h.send_html(T.event_detail(event, tts, payments.is_live(),
-            error="Please pick at least one ticket and enter your name, email and phone."), 400)
+            error="Please pick at least one ticket and enter your name, email and phone.", fee_cfg=db.fee_config()), 400)
     try:
         oid = db.create_order(eid, name, email, items,
                               provider=("stripe" if payments.is_live() else "mock"),
                               currency=event["currency"], buyer_phone=phone,
                               discount_code=dcode)
     except ValueError as e:
-        return h.send_html(T.event_detail(event, tts, payments.is_live(), error=str(e)), 400)
+        return h.send_html(T.event_detail(event, tts, payments.is_live(),
+                                          error=str(e), fee_cfg=db.fee_config()), 400)
 
     order = db.get_order(oid)
     line_items = [{"name": db.get_ticket_type(tt)["name"], "qty": q,
@@ -591,11 +592,32 @@ def admin_test_email(h):
     })
 
 
+@route("POST", "/admin/settings/fee")
+def admin_save_fee(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    try:
+        pct = float(flat.get("fee_percent", "0") or 0)
+        fixed_pounds = float(flat.get("fee_fixed", "0") or 0)
+    except ValueError:
+        return h.redirect("/admin/discounts?fee=bad")
+    if pct < 0 or fixed_pounds < 0:
+        return h.redirect("/admin/discounts?fee=bad")
+
+    db.set_setting("fee_percent", pct)
+    db.set_setting("fee_fixed", int(round(fixed_pounds * 100)))   # £ -> pence
+    db.set_setting("fee_label", (flat.get("fee_label") or "Booking fee").strip())
+    h.redirect("/admin/discounts?fee=saved")
+
+
 @route("GET", "/admin/discounts")
 def admin_discounts(h):
     if not require_admin(h):
         return
-    h.send_html(T.admin_discounts(db.list_discounts(), db.list_events()))
+    h.send_html(T.admin_discounts(db.list_discounts(), db.list_events(),
+                                  fee_cfg=db.fee_config(),
+                                  saved=(h.query.get("fee") == "saved")))
 
 
 @route("POST", "/admin/discounts/new")
@@ -615,7 +637,8 @@ def admin_discounts_new(h):
             value = int(round(float(raw_value) * 100))   # £ -> pence
     except ValueError:
         return h.send_html(T.admin_discounts(db.list_discounts(), db.list_events(),
-                                             error="Enter a number for the value."), 400)
+                                             error="Enter a number for the value.",
+                                             fee_cfg=db.fee_config()), 400)
 
     expires_at = None
     if expires_raw:
@@ -626,7 +649,8 @@ def admin_discounts_new(h):
                                           23, 59, 59, 0, 0, -1)))
         except ValueError:
             return h.send_html(T.admin_discounts(db.list_discounts(), db.list_events(),
-                                                 error="Invalid expiry date."), 400)
+                                                 error="Invalid expiry date.",
+                                                 fee_cfg=db.fee_config()), 400)
 
     try:
         db.create_discount(
@@ -637,7 +661,7 @@ def admin_discounts_new(h):
         )
     except ValueError as e:
         return h.send_html(T.admin_discounts(db.list_discounts(), db.list_events(),
-                                             error=str(e)), 400)
+                                             error=str(e), fee_cfg=db.fee_config()), 400)
     h.redirect("/admin/discounts")
 
 

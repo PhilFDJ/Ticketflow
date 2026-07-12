@@ -101,6 +101,13 @@ def _migrate(conn):
       created_at   INTEGER NOT NULL
     )""")
 
+    # Site settings (booking fee, etc). One row, keyed by name.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS settings (
+      key    TEXT PRIMARY KEY,
+      value  TEXT NOT NULL
+    )""")
+
     ocols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
     if "buyer_phone" not in ocols:
         # Phone number, so you can chase a no-show or an abandoned cart.
@@ -112,6 +119,10 @@ def _migrate(conn):
         conn.execute("ALTER TABLE orders ADD COLUMN discount_code TEXT NOT NULL DEFAULT ''")
         conn.execute("ALTER TABLE orders ADD COLUMN discount_amount INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE orders ADD COLUMN subtotal INTEGER NOT NULL DEFAULT 0")
+    if "booking_fee" not in ocols:
+        # Booking fee, charged per order to cover Stripe's cut. Shown separately
+        # at checkout; `total` includes it.
+        conn.execute("ALTER TABLE orders ADD COLUMN booking_fee INTEGER NOT NULL DEFAULT 0")
 
     ecols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
     if "image" not in ecols:
@@ -287,17 +298,21 @@ def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
     if discount_code:
         disc, off = validate_discount(discount_code, event_id, subtotal)
 
-    total = subtotal - off      # what the customer ACTUALLY pays
+    after_discount = subtotal - off
+    # Fee is per ORDER (not per ticket) and calculated after the discount, so a
+    # code doesn't inflate the fee. The customer pays tickets - discount + fee.
+    fee = calc_booking_fee(after_discount)
+    total = after_discount + fee
 
     with cursor() as conn:
         conn.execute(
             "INSERT INTO orders (id,event_id,buyer_name,buyer_email,buyer_phone,"
-            "total,subtotal,discount_id,discount_code,discount_amount,"
+            "total,subtotal,discount_id,discount_code,discount_amount,booking_fee,"
             "currency,status,provider,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (oid, event_id, buyer_name, buyer_email, buyer_phone or "", total,
              subtotal, disc["id"] if disc else None,
-             disc["code"] if disc else "", off,
+             disc["code"] if disc else "", off, fee,
              currency, "pending", provider, now()),
         )
         for tt_id, qty, price in resolved:
@@ -632,6 +647,65 @@ def redeem_discount(did, order_id, amount_off):
             " VALUES (?,?,?,?,?)",
             (new_id("du"), did, order_id, amount_off, now()))
     return True
+
+
+# ---------------------------------------------------------------------------
+# Settings & booking fee
+# ---------------------------------------------------------------------------
+DEFAULT_SETTINGS = {
+    "fee_percent": "0",     # e.g. "5" for 5%
+    "fee_fixed": "0",       # pence, e.g. "20" for 20p
+    "fee_label": "Booking fee",
+}
+
+
+def get_setting(key, default=None):
+    with cursor() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    if row is not None:
+        return row["value"]
+    if default is not None:
+        return default
+    return DEFAULT_SETTINGS.get(key, "")
+
+
+def set_setting(key, value):
+    with cursor() as conn:
+        conn.execute(
+            "INSERT INTO settings (key,value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)))
+
+
+def fee_config():
+    """The booking fee settings, as numbers."""
+    try:
+        pct = float(get_setting("fee_percent") or 0)
+    except ValueError:
+        pct = 0.0
+    try:
+        fixed = int(get_setting("fee_fixed") or 0)
+    except ValueError:
+        fixed = 0
+    return {
+        "percent": max(0.0, pct),
+        "fixed": max(0, fixed),
+        "label": get_setting("fee_label") or "Booking fee",
+        "enabled": pct > 0 or fixed > 0,
+    }
+
+
+def calc_booking_fee(amount):
+    """Booking fee for an order, charged ONCE per booking (not per ticket).
+
+    Worked out on the amount actually being paid — i.e. AFTER any discount — so a
+    discount code doesn't quietly inflate the fee.
+    """
+    cfg = fee_config()
+    if not cfg["enabled"] or amount <= 0:
+        return 0
+    fee = int(round(amount * cfg["percent"] / 100.0)) + cfg["fixed"]
+    return max(0, fee)
 
 
 def tickets_for_order(oid):

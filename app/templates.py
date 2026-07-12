@@ -193,7 +193,9 @@ def _maps_link(event):
     return f'<p class="venue-addr">{_nl2br(addr)}</p>'
 
 
-def event_detail(event, ticket_types, live_mode, error=None):
+def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None):
+    fee_cfg = fee_cfg or {"percent": 0, "fixed": 0, "label": "Booking fee",
+                          "enabled": False}
     d = fmt_date(event["starts_at"])
     accent = event["image_url"] if (event["image_url"] or "").startswith("#") else "#4f46e5"
     _img = (event["image"] or "") if "image" in event.keys() else ""
@@ -247,10 +249,18 @@ def event_detail(event, ticket_types, live_mode, error=None):
           <input name="discount_code" placeholder="e.g. EARLYBIRD"
                  style="text-transform:uppercase" autocomplete="off">
         </div>
+        <div class="mt3 feebox" id="feebox" style="display:none">
+          <div class="feerow"><span class="muted">Tickets</span>
+            <span id="sub">{money(0, event['currency'])}</span></div>
+          <div class="feerow"><span class="muted">{esc(fee_cfg['label'])}</span>
+            <span id="fee">{money(0, event['currency'])}</span></div>
+        </div>
         <div class="mt3" style="display:flex;align-items:center;justify-content:space-between">
           <div class="muted">Total <span id="total" style="color:var(--ink);font-size:20px;font-weight:700">{money(0, event['currency'])}</span></div>
           <button class="btn" id="checkoutbtn" type="submit" disabled>Checkout →</button>
         </div>
+        <p class="muted small mt1" id="feenote" style="display:none">
+          {esc(fee_cfg['label'])} is charged once per booking, not per ticket.</p>
       </form>""" if any_available else '<div class="flash info">This event is sold out.</div>'
 
     body = f"""
@@ -282,13 +292,31 @@ def event_detail(event, ticket_types, live_mode, error=None):
         inp.value = v; recompute();
       }}
       function recompute(){{
-        let total = 0, count = 0;
+        let sub = 0, count = 0;
         document.querySelectorAll('.stepper').forEach(s=>{{
           const price = parseInt(s.getAttribute('data-price'));
           const q = parseInt(s.querySelector('input').value||'0');
-          total += price*q; count += q;
+          sub += price*q; count += q;
         }});
-        document.getElementById('total').textContent = fmt(total);
+        // Booking fee: once per booking, not per ticket. Mirrors calc_booking_fee()
+        // on the server — the server's figure is authoritative, this is the preview.
+        const FEE_PCT = {fee_cfg['percent']}, FEE_FIXED = {fee_cfg['fixed']};
+        let fee = 0;
+        if(sub > 0 && (FEE_PCT > 0 || FEE_FIXED > 0)){{
+          fee = Math.round(sub * FEE_PCT / 100) + FEE_FIXED;
+        }}
+        const box = document.getElementById('feebox');
+        const note = document.getElementById('feenote');
+        if(fee > 0){{
+          document.getElementById('sub').textContent = fmt(sub);
+          document.getElementById('fee').textContent = fmt(fee);
+          if(box) box.style.display = '';
+          if(note) note.style.display = '';
+        }} else {{
+          if(box) box.style.display = 'none';
+          if(note) note.style.display = 'none';
+        }}
+        document.getElementById('total').textContent = fmt(sub + fee);
         const btn = document.getElementById('checkoutbtn');
         if(btn) btn.disabled = count===0;
       }}
@@ -738,7 +766,9 @@ def admin_door(event, parties):
     return layout("On the door", body, admin=True)
 
 
-def admin_discounts(discounts, events, error=None):
+def admin_discounts(discounts, events, error=None, fee_cfg=None, saved=False):
+    fee_cfg = fee_cfg or {"percent": 0, "fixed": 0, "label": "Booking fee",
+                          "enabled": False}
     rows = []
     for d in discounts:
         if d["kind"] == "percent":
@@ -795,10 +825,50 @@ def admin_discounts(discounts, events, error=None):
     event_opts = "".join(
         f'<option value="{esc(e["id"])}">{esc(e["title"])}</option>' for e in events)
 
+    # Worked example so you can see what the fee actually does to a real order.
+    ex_sub = 1600   # a typical 2 x £8 booking
+    ex_fee = int(round(ex_sub * fee_cfg["percent"] / 100.0)) + fee_cfg["fixed"]
+    # Stripe UK: roughly 1.5% + 20p per transaction.
+    ex_stripe = int(round((ex_sub + ex_fee) * 0.015)) + 20
+    covered = ex_fee >= ex_stripe
+
     return layout("Discount codes", f"""
     <a href="/admin" class="muted small">← Dashboard</a>
-    <h1 class="mt2">Discount codes</h1>
+    <h1 class="mt2">Booking fee &amp; discounts</h1>
+    {flash("ok", "Booking fee saved.") if saved else ""}
     {flash("err", error) if error else ""}
+
+    <div class="card mt2"><div class="body">
+      <h2 class="mt0">Booking fee
+        {'<span class="pill ok">On</span>' if fee_cfg["enabled"]
+         else '<span class="pill">Off</span>'}</h2>
+      <p class="muted small">Charged <b>once per booking</b> (not per ticket), on top of the
+        ticket price, and shown separately at checkout. Set both to 0 to turn it off.</p>
+      <form method="post" action="/admin/settings/fee">
+        <div class="row mt2">
+          <div><label>Percentage</label>
+            <input name="fee_percent" value="{fee_cfg['percent']:g}" placeholder="5">
+            <p class="muted small mt1">% of the order</p></div>
+          <div><label>Plus fixed amount (£)</label>
+            <input name="fee_fixed" value="{fee_cfg['fixed']/100:.2f}" placeholder="0.20"></div>
+          <div><label>Call it</label>
+            <input name="fee_label" value="{esc(fee_cfg['label'])}" placeholder="Booking fee"></div>
+        </div>
+        <div class="mt3"><button class="btn" type="submit">Save booking fee</button></div>
+      </form>
+
+      <div class="mt3 muted small" style="border-top:1px solid var(--line);padding-top:12px">
+        <b>On a 2 &times; £8 booking ({money(ex_sub)}):</b><br>
+        You'd charge {money(ex_fee)} — customer pays {money(ex_sub + ex_fee)}.<br>
+        Stripe takes about {money(ex_stripe)} of that.
+        {'<span style="color:#22c55e">Your fee covers it.</span>' if covered
+         else '<span style="color:#f59e0b">Your fee does not cover it — you absorb '
+              + money(ex_stripe - ex_fee) + '.</span>' if fee_cfg["enabled"]
+         else 'With no fee, you absorb all of it.'}
+      </div>
+    </div></div>
+
+    <h2 class="mt3">Discount codes</h2>
 
     <div class="card mt2"><div class="body">
       {'<table><thead><tr><th>Code</th><th>Worth</th><th>Valid for</th><th>Used</th>'

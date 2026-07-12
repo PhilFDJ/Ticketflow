@@ -47,6 +47,12 @@ def mode_label():
     return "test"              # Stripe sandbox
 
 
+def fee_label():
+    """What the booking fee is called on the Stripe receipt and at checkout."""
+    import db as _db
+    return _db.fee_config()["label"]
+
+
 def _form_encode(data, parent=None):
     """Encode nested dict/list into Stripe's bracketed form format."""
     items = []
@@ -100,6 +106,19 @@ def create_checkout(order, items, event, base_url):
         },
         "quantity": it["qty"],
     } for it in items]
+
+    # The booking fee must be CHARGED, not just displayed. Add it as its own line
+    # so it appears on the customer's Stripe receipt exactly as it did at checkout.
+    fee = order["booking_fee"] if "booking_fee" in order.keys() else 0
+    if fee and fee > 0:
+        line_items.append({
+            "price_data": {
+                "currency": event["currency"].lower(),
+                "product_data": {"name": fee_label()},
+                "unit_amount": fee,
+            },
+            "quantity": 1,
+        })
 
     payload = {
         "mode": "payment",

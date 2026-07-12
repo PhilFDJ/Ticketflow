@@ -256,3 +256,7 @@ footer.site{border-top:1px solid var(--line);color:var(--muted);font-size:13px;p
 .att-tabs-link.on{background:var(--brand);border-color:var(--brand);color:#fff}
 tr.abandoned{opacity:.85}
 tr.abandoned td:first-child{border-left:3px solid var(--warn,#f59e0b)}
+
+/* Booking fee breakdown at checkout */
+.feebox{border-top:1px solid var(--line);padding-top:12px}
+.feerow{display:flex;justify-content:space-between;font-size:14px;padding:3px 0}
