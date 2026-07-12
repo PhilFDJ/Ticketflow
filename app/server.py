@@ -448,9 +448,15 @@ def ticket_pass(h, code):
 
     h.send_response(200)
     h.send_header("Content-Type", "application/vnd.apple.pkpass")
+    # MUST be inline, not attachment. With `attachment`, iOS Safari tries to save
+    # the file — and since iOS has no file manager for .pkpass, it just says
+    # "Safari cannot download this file". Served inline, iOS recognises the MIME
+    # type and hands it straight to Wallet.
     h.send_header("Content-Disposition",
-                  f'attachment; filename="mayhem-bingo-{code}.pkpass"')
+                  f'inline; filename="mayhem-bingo-{esc_code(code)}.pkpass"')
     h.send_header("Content-Length", str(len(data)))
+    # Don't let a stale pass be cached — the ticket's state can change.
+    h.send_header("Cache-Control", "no-store")
     h.end_headers()
     h.wfile.write(data)
 

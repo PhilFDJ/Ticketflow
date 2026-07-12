@@ -84,16 +84,24 @@ def _read_static(name):
 
 
 def _artwork():
-    """icon.png is mandatory; logo.png shows on the pass front."""
-    logo = _read_static("logo.png")
+    """Apple validates artwork sizes strictly: icon.png must be 29x29 (58x58 for
+    @2x), logo.png at most 160x50. Wrong sizes get the whole pass rejected — which
+    surfaces to the buyer as Safari refusing to open the file at all.
+
+    These are PRE-GENERATED at the correct sizes and shipped as static files, so
+    the server needs no image library (the app installs nothing on deploy).
+    """
     files = {}
-    if logo:
-        # Apple wants an icon; reusing the logo is acceptable and keeps this
-        # dependency-free (no image resizing library needed).
-        files["icon.png"] = logo
-        files["icon@2x.png"] = logo
-        files["logo.png"] = logo
-        files["logo@2x.png"] = logo
+    mapping = {
+        "icon.png":    "pass-icon.png",
+        "icon@2x.png": "pass-icon@2x.png",
+        "logo.png":    "pass-logo.png",
+        "logo@2x.png": "pass-logo@2x.png",
+    }
+    for pass_name, static_name in mapping.items():
+        data = _read_static(static_name)
+        if data:
+            files[pass_name] = data
     return files
 
 
@@ -170,8 +178,19 @@ def build_pass(ticket, event, base_url) -> bytes:
 
 
 def _iso(ts):
+    """ISO 8601 as Apple wants it: 2026-09-04T19:00:00+01:00
+
+    Note the COLON in the timezone offset. Python's %z gives '+0100' with no
+    colon, which Apple rejects — and a rejected pass shows up to the buyer as
+    Safari refusing to open the file.
+    """
     import time
-    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(int(ts))) or ""
+    lt = time.localtime(int(ts))
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", lt)
+    off = time.strftime("%z", lt)          # e.g. +0100
+    if len(off) == 5:                      # insert the colon: +01:00
+        off = off[:3] + ":" + off[3:]
+    return stamp + (off or "+00:00")
 
 
 def _sign(manifest_bytes: bytes) -> bytes:
