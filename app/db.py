@@ -386,6 +386,24 @@ def event_attendance(event_id):
     return out
 
 
+def known_venues():
+    """Every venue+address you've used before, most-recent first.
+
+    There's no separate venues table — events already hold this. Deduping on the
+    venue name means picking one gives you the address you last used for it, so
+    you never retype (or mistype) a repeat venue.
+    """
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT venue, address, MAX(starts_at) AS last_used "
+            "FROM events "
+            "WHERE TRIM(venue) != '' "
+            "GROUP BY LOWER(TRIM(venue)) "
+            "ORDER BY last_used DESC"
+        ).fetchall()
+    return [{"venue": r["venue"], "address": r["address"] or ""} for r in rows]
+
+
 def tickets_for_order(oid):
     with cursor() as conn:
         rows = conn.execute(

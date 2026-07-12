@@ -1,5 +1,6 @@
 """HTML rendering for Mayhem Bingo tickets. Pure string templating, stdlib only."""
 import html
+import json
 import urllib.parse
 import time
 
@@ -836,8 +837,15 @@ _NEW_EVENT_SCRIPT = """
     </script>"""
 
 
-def admin_new_event(error=None):
+def admin_new_event(error=None, venues=None):
     err = flash("err", error) if error else ""
+    venues = venues or []
+    # Native <datalist> gives autocomplete with no JS library, and works on mobile.
+    venue_options = "".join(
+        f'<option value="{esc(v["venue"])}"></option>' for v in venues
+    )
+    # venue name -> the address last used for it, so picking one fills the address.
+    venue_addr_map = json.dumps({v["venue"]: v["address"] for v in venues})
     form = f"""
     <a href="/admin" class="muted small">← Dashboard</a>
     <h1 class="mt2">Create event</h1>
@@ -847,9 +855,14 @@ def admin_new_event(error=None):
         <label>Title</label>
         <input name="title" required placeholder="Friday Night Live">
         <label>Venue</label>
-        <input name="venue" placeholder="The Brickyard, Manchester">
-        <label>Venue address <span class="muted small">(shown on the ticket, links to maps)</span></label>
-        <input name="address" placeholder="12 High Street, Huddersfield, HD1 2AB">
+        <input name="venue" id="venueInput" list="venueList" autocomplete="off"
+               placeholder="The Social Club">
+        <datalist id="venueList">{venue_options}</datalist>
+        <label>Venue address <span class="muted small">(shown on the ticket)</span></label>
+        <textarea name="address" id="addressInput" rows="3"
+                  placeholder="12 High Street&#10;Huddersfield&#10;HD1 2AB"></textarea>
+        <p class="muted small mt1">Pick a venue you've used before and its address fills in
+          automatically. Type it once; it's remembered.</p>
         <label>Description</label>
         <textarea name="description" placeholder="Tell people what to expect…"></textarea>
         <div class="row">
@@ -881,7 +894,30 @@ def admin_new_event(error=None):
 
       <div class="mt3"><button class="btn" type="submit">Create event</button></div>
     </form>"""
-    return layout("New event", form + _NEW_EVENT_SCRIPT, admin=True)
+    venue_script = f"""
+    <script>
+      // Picking a venue you've used before fills in its address — so a repeat
+      // venue is never retyped (and never mistyped).
+      (function(){{
+        var addrs = {venue_addr_map};
+        var v = document.getElementById('venueInput');
+        var a = document.getElementById('addressInput');
+        if(!v || !a) return;
+        function fill(){{
+          var known = addrs[v.value];
+          // Only auto-fill if the address box is empty or still holds the address
+          // of a different known venue — never clobber something typed by hand.
+          var typed = a.value.trim();
+          var isKnownAddr = Object.keys(addrs).some(function(k){{
+            return addrs[k].trim() === typed && typed !== '';
+          }});
+          if(known && (typed === '' || isKnownAddr)) a.value = known;
+        }}
+        v.addEventListener('change', fill);
+        v.addEventListener('input', fill);
+      }})();
+    </script>"""
+    return layout("New event", form + _NEW_EVENT_SCRIPT + venue_script, admin=True)
 
 
 def _dtlocal(ts):
@@ -904,7 +940,11 @@ def _cover_preview(event):
     )
 
 
-def admin_event(event, ticket_types, stats, orders, live_mode, error=None):
+def admin_event(event, ticket_types, stats, orders, live_mode, error=None, venues=None):
+    venues = venues or []
+    e_venue_options = "".join(
+        f'<option value="{esc(v["venue"])}"></option>' for v in venues)
+    e_venue_addrs = json.dumps({v["venue"]: v["address"] for v in venues})
     tt_rows = []
     for t in ticket_types:
         tt_rows.append(f"""
@@ -956,10 +996,11 @@ def admin_event(event, ticket_types, stats, orders, live_mode, error=None):
         <input name="title" value="{esc(event['title'])}" required>
         <div class="row">
           <div><label>Venue</label>
-            <input name="venue" value="{esc(event['venue'])}"></div>
+            <input name="venue" id="eVenueInput" list="eVenueList" autocomplete="off"
+                   value="{esc(event['venue'])}"></div>
           <div><label>Venue address</label>
-            <input name="address" value="{esc(event['address'] if 'address' in event.keys() else '')}"
-                   placeholder="12 High Street, Huddersfield, HD1 2AB"></div>
+            <textarea name="address" id="eAddressInput" rows="3"
+                      placeholder="12 High Street&#10;Huddersfield&#10;HD1 2AB">{esc(event['address'] if 'address' in event.keys() else '')}</textarea></div>
           <div><label>Date &amp; time</label>
             <input name="starts_at" type="datetime-local" value="{_dtlocal(event['starts_at'])}"></div>
         </div>
@@ -976,6 +1017,25 @@ def admin_event(event, ticket_types, stats, orders, live_mode, error=None):
 
         <div class="mt3"><button class="btn" type="submit">Save changes</button></div>
       </form>
+      <datalist id="eVenueList">{e_venue_options}</datalist>
+      <script>
+        (function(){{
+          var addrs = {e_venue_addrs};
+          var v = document.getElementById('eVenueInput');
+          var a = document.getElementById('eAddressInput');
+          if(!v || !a) return;
+          function fill(){{
+            var known = addrs[v.value];
+            var typed = a.value.trim();
+            var isKnownAddr = Object.keys(addrs).some(function(k){{
+              return addrs[k].trim() === typed && typed !== '';
+            }});
+            if(known && (typed === '' || isKnownAddr)) a.value = known;
+          }}
+          v.addEventListener('change', fill);
+          v.addEventListener('input', fill);
+        }})();
+      </script>
     </div></div>
 
     <div class="card mt3"><div class="body">

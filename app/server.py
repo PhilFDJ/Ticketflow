@@ -671,7 +671,7 @@ def admin_dashboard(h):
 def admin_new_event(h):
     if not require_admin(h):
         return
-    h.send_html(T.admin_new_event())
+    h.send_html(T.admin_new_event(venues=db.known_venues()))
 
 
 @route("POST", "/admin/events/new")
@@ -681,7 +681,8 @@ def admin_create_event(h):
     flat, multi = h.form()
     title = flat.get("title", "").strip()
     if not title:
-        return h.send_html(T.admin_new_event(error="Title is required."), 400)
+        return h.send_html(T.admin_new_event(error="Title is required.",
+                                             venues=db.known_venues()), 400)
     # parse datetime-local (YYYY-MM-DDTHH:MM)
     import time as _t
     starts = flat.get("starts_at", "")
@@ -689,12 +690,13 @@ def admin_create_event(h):
         tm = _t.strptime(starts, "%Y-%m-%dT%H:%M")
         starts_at = int(_t.mktime(tm))
     except ValueError:
-        return h.send_html(T.admin_new_event(error="Please provide a valid date & time."), 400)
+        return h.send_html(T.admin_new_event(error="Please provide a valid date & time.",
+                                             venues=db.known_venues()), 400)
     # Cover image: an uploaded file wins; otherwise an external URL if given.
     try:
         image = save_upload(getattr(h, "files", {}), "image_file") or flat.get("image", "").strip()
     except ValueError as e:
-        return h.send_html(T.admin_new_event(error=str(e)), 400)
+        return h.send_html(T.admin_new_event(error=str(e), venues=db.known_venues()), 400)
 
     eid = db.create_event(
         title=title, description=flat.get("description", ""),
@@ -725,7 +727,7 @@ def admin_event(h, eid):
         return h.send_html(T.layout("Not found", "<h1>Event not found</h1>"), 404)
     h.send_html(T.admin_event(event, db.list_ticket_types(eid),
                               db.event_stats(eid), db.list_orders(eid),
-                              payments.is_live()))
+                              payments.is_live(), venues=db.known_venues()))
 
 
 @route("POST", "/admin/ticket-types/add")
@@ -790,7 +792,8 @@ def admin_edit_event(h):
         stats = db.event_stats(eid)
         orders = db.list_orders(eid)
         return h.send_html(T.admin_event(event, tts, stats, orders,
-                                         payments.is_live(), error=str(e)), 400)
+                                         payments.is_live(), error=str(e),
+                                         venues=db.known_venues()), 400)
     if not new_image and flat.get("image", "").strip():
         new_image = flat["image"].strip()
     if new_image:
