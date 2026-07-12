@@ -46,6 +46,10 @@ services:
       - key: MAIL_FROM
         value: Mayhem Bingo <tickets@phil-freeman.co.uk>
 
+      # tickets@ doesn't exist as a mailbox — send replies somewhere real.
+      - key: MAIL_REPLY_TO
+        value: phil@phil-freeman.co.uk
+
       # Don't create the fake demo events (jazz brunch etc) on a real ticket site.
       - key: NO_SEED
         value: "1"

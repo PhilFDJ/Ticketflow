@@ -38,6 +38,16 @@ def from_address() -> str:
     return os.environ.get("MAIL_FROM", "Mayhem Bingo <tickets@phil-freeman.co.uk>").strip()
 
 
+def reply_to() -> str:
+    """Where replies actually land.
+
+    We send FROM tickets@phil-freeman.co.uk because that domain is verified with
+    Resend — but that mailbox doesn't exist. Without a Reply-To, a buyer hitting
+    "reply" would bounce into nowhere. So replies are directed to a real inbox.
+    """
+    return os.environ.get("MAIL_REPLY_TO", "phil@phil-freeman.co.uk").strip()
+
+
 def send(to_email: str, subject: str, html: str, text: str = "") -> bool:
     """Send one email. Returns True on success, False on any failure.
 
@@ -62,6 +72,9 @@ def _send_resend(to_email, subject, html, text) -> bool:
         "subject": subject,
         "html": html,
     }
+    rt = reply_to()
+    if rt:
+        payload["reply_to"] = rt
     if text:
         payload["text"] = text
     req = urllib.request.Request(
@@ -88,6 +101,9 @@ def _send_smtp(to_email, subject, html, text) -> bool:
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = from_address()
+    rt = reply_to()
+    if rt:
+        msg["Reply-To"] = rt
     msg["To"] = to_email
     msg.set_content(text or "Your tickets are attached — open the link to view them.")
     msg.add_alternative(html, subtype="html")
