@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import db
 import mailer
 import payments
+import wallet
 import qrgen
 import templates as T
 from tokens import make_session, verify_session, new_id
@@ -423,13 +424,48 @@ def success(h):
                           emailed=emailed, email_on=mailer.is_configured()))
 
 
+@route("GET", r"/t/(?P<code>[\w\-]+)/pass")
+def ticket_pass(h, code):
+    """Serve a signed Apple Wallet pass for one ticket."""
+    t = db.get_ticket_by_code(code)
+    if not t:
+        return h.send_html(T.layout("Not found", "<h1>Ticket not found</h1>"), 404)
+    if not wallet.is_configured():
+        return h.send_html(T.layout("Unavailable",
+            '<div class="narrow" style="margin:0 auto">'
+            '<div class="flash err">Apple Wallet isn\'t set up on this site yet.</div>'
+            f'<a href="/t/{esc_code(code)}">← Back to your ticket</a></div>'), 404)
+    event = db.get_event(t["event_id"])
+    try:
+        data = wallet.build_pass(t, event, h.base_url())
+    except Exception as e:
+        print(f"[wallet] pass build failed for {code}: {e}")
+        return h.send_html(T.layout("Error",
+            '<div class="narrow" style="margin:0 auto">'
+            '<div class="flash err">Couldn\'t build the Wallet pass. '
+            'Your ticket still works — show the QR at the door.</div>'
+            f'<a href="/t/{esc_code(code)}">← Back to your ticket</a></div>'), 500)
+
+    h.send_response(200)
+    h.send_header("Content-Type", "application/vnd.apple.pkpass")
+    h.send_header("Content-Disposition",
+                  f'attachment; filename="mayhem-bingo-{code}.pkpass"')
+    h.send_header("Content-Length", str(len(data)))
+    h.end_headers()
+    h.wfile.write(data)
+
+
+def esc_code(c):
+    return re.sub(r"[^\w\-]", "", c or "")
+
+
 @route("GET", r"/t/(?P<code>[\w\-]+)")
 def ticket_view(h, code):
     t = db.get_ticket_by_code(code)
     if not t:
         return h.send_html(T.layout("Not found",
             '<h1>Ticket not found</h1><p class="muted">This code isn\'t valid.</p>'), 404)
-    h.send_html(T.ticket_page(t, qr_svg(code)))
+    h.send_html(T.ticket_page(t, qr_svg(code), wallet_on=wallet.is_configured()))
 
 
 # ---- scanning -------------------------------------------------------
@@ -580,7 +616,9 @@ def admin_dashboard(h):
     h.send_html(T.admin_dashboard(events, stats, payments.is_live(),
                                   mail_on=mailer.is_configured(),
                                   mail_from=mailer.from_address(),
-                                  mail_reply=mailer.reply_to()))
+                                  mail_reply=mailer.reply_to(),
+                                  wallet_on=wallet.is_configured(),
+                                  wallet_problem=wallet.config_problem()))
 
 
 @route("GET", "/admin/events/new")

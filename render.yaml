@@ -54,5 +54,16 @@ services:
       - key: NO_SEED
         value: "1"
 
+      # Apple Wallet passes. All four are needed or the Wallet button stays hidden
+      # (tickets still work by QR/link/email/print). See WALLET-SETUP.md.
+      - key: APPLE_PASS_TYPE_ID
+        sync: false
+      - key: APPLE_TEAM_ID
+        sync: false
+      - key: APPLE_PASS_CERT
+        sync: false
+      - key: APPLE_WWDR_CERT
+        sync: false
+
       - key: PYTHON_VERSION
         value: "3.11.9"

@@ -330,7 +330,26 @@ def success(order, event, tickets, qr_svgs, emailed=False, email_on=False):
     </div>""")
 
 
-def ticket_page(t, qr_svg):
+def ticket_page(t, qr_svg, wallet_on=False):
+    # Only worth showing on Apple devices — a .pkpass does nothing elsewhere. We
+    # detect client-side rather than sniffing the User-Agent server-side.
+    wallet_btn = ("" if not wallet_on else f"""
+    <div class="center mt2 no-print" id="walletWrap" style="display:none">
+      <a class="applewallet" href="/t/{esc(t['code'])}/pass">
+        <span class="aw-icon"></span>
+        <span class="aw-text"><small>Add to</small><b>Apple Wallet</b></span>
+      </a>
+    </div>
+    <script>
+      // Show the Wallet button only on iPhone/iPad/Mac — a .pkpass is useless
+      // on Android or Windows and would just download a file they can't open.
+      (function(){{
+        var ua = navigator.userAgent || '';
+        var isApple = /iPhone|iPad|iPod|Macintosh/.test(ua);
+        if(isApple){{ document.getElementById('walletWrap').style.display = ''; }}
+      }})();
+    </script>""")
+
     return layout("Ticket", f"""
     <div class="ticket ticket-print">
       <div class="top">
@@ -346,6 +365,7 @@ def ticket_page(t, qr_svg):
       <div class="qr">{qr_svg}</div>
       <div class="code">{esc(t['code'])}</div>
     </div>
+    {wallet_btn}
     <div class="center mt3 no-print">
       <button class="btn ghost sm" onclick="window.print()">🖨️ Print ticket</button>
     </div>
@@ -680,7 +700,7 @@ def admin_login(error=None):
     </div>""")
 
 
-def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from="", mail_reply=""):
+def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from="", mail_reply="", wallet_on=False, wallet_problem=""):
     rows = []
     tot_rev = 0
     for e in events:
@@ -702,6 +722,16 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
             else '<span class="pill warn">Mock payments</span>')
     mail_badge = ('<span class="pill ok">On</span>' if mail_on
                   else '<span class="pill bad">Off</span>')
+    wallet_badge = ('<span class="pill ok">On</span>' if wallet_on
+                    else '<span class="pill bad">Off</span>')
+    if wallet_on:
+        wallet_note = ('<p class="muted small">iPhone buyers see an '
+                       '<b>Add to Apple Wallet</b> button on their ticket.</p>')
+    else:
+        wallet_note = (f'<p class="muted small">Apple Wallet passes are off, so no '
+                       f'button is shown. Tickets still work by QR, link and print.<br>'
+                       f'<code>{esc(wallet_problem)}</code><br>'
+                       f'See WALLET-SETUP.md for how to generate the certificates.</p>')
     if mail_on:
         mail_note = (f'<p class="muted small">Buyers are emailed their tickets. '
                      f'Sent from <b>{esc(mail_from)}</b>, replies go to '
@@ -722,6 +752,11 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
       <div class="stat"><div class="n">{mode}</div><div class="l">Payments</div></div>
     </div>
     <div class="card mt3"><div class="body">{table}</div></div>
+
+    <div class="card mt3"><div class="body">
+      <h2 class="mt0">Apple Wallet {wallet_badge}</h2>
+      {wallet_note}
+    </div></div>
 
     <div class="card mt3"><div class="body">
       <h2 class="mt0">Ticket emails {mail_badge}</h2>

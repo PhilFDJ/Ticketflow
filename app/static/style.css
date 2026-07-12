@@ -219,3 +219,17 @@ footer.site{border-top:1px solid var(--line);color:var(--muted);font-size:13px;p
   box-shadow:0 0 0 100vmax rgba(0,0,0,.25);
   pointer-events:none;
 }
+
+/* "Add to Apple Wallet" button. Apple's guidelines want a black pill with the
+   wallet glyph and this exact wording — don't restyle it to match the site. */
+.applewallet{display:inline-flex;align-items:center;gap:10px;background:#000;color:#fff;
+  border-radius:10px;padding:9px 16px 9px 12px;text-decoration:none;border:1px solid #333;
+  transition:filter .12s}
+.applewallet:hover{filter:brightness(1.25);text-decoration:none}
+.applewallet .aw-icon{width:26px;height:26px;flex:0 0 auto;border-radius:5px;
+  background:linear-gradient(160deg,#f6d365,#fda085 45%,#f76b8a);position:relative}
+.applewallet .aw-icon::after{content:"";position:absolute;left:4px;right:4px;top:8px;height:3px;
+  background:rgba(255,255,255,.9);border-radius:2px;box-shadow:0 5px 0 rgba(255,255,255,.55)}
+.applewallet .aw-text{display:flex;flex-direction:column;line-height:1.1;text-align:left}
+.applewallet .aw-text small{font-size:10px;opacity:.75;letter-spacing:.02em}
+.applewallet .aw-text b{font-size:15px;font-weight:600}
