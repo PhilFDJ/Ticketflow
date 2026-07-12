@@ -296,3 +296,12 @@ footer.site a{color:var(--muted);text-decoration:underline}
 .btn.danger:hover{background:#b91c1c}
 .danger-link{color:#f87171!important}
 .danger-link:hover{background:rgba(220,38,38,.12)}
+
+/* Add-ons */
+.addons{border-top:1px solid var(--line);padding-top:16px}
+.addons-h{font-size:17px}
+.prods{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.prodchip{background:var(--panel-2);border:1px solid var(--line);color:var(--ink);
+  border-radius:999px;padding:4px 11px;font-size:12px;font-weight:600;cursor:pointer}
+.prodchip:hover{border-color:var(--brand)}
+.prodchip.got{background:rgba(34,197,94,.15);border-color:#22c55e;color:#22c55e}

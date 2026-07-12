@@ -122,6 +122,59 @@ def _migrate(conn):
       value  TEXT NOT NULL
     )""")
 
+    # Add-ons sold alongside tickets — dabbers, drinks vouchers, raffle strips.
+    # GLOBAL: one catalogue, one stock level, offered at every event. A box of 40
+    # dabbers is one box — selling them across three nights draws from the same box.
+    # Handed over on the night, so they MUST appear on the door list.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS products (
+      id          TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      price       INTEGER NOT NULL,        -- pence
+      quantity    INTEGER,                 -- master stock. NULL = unlimited.
+      sold        INTEGER NOT NULL DEFAULT 0,
+      max_each    INTEGER NOT NULL DEFAULT 10,  -- cap per booking
+      active      INTEGER NOT NULL DEFAULT 1,
+      sort_order  INTEGER NOT NULL DEFAULT 0,
+      created_at  INTEGER NOT NULL
+    )""")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS order_products (
+      id          TEXT PRIMARY KEY,
+      order_id    TEXT NOT NULL,
+      product_id  TEXT NOT NULL,
+      qty         INTEGER NOT NULL,
+      unit_price  INTEGER NOT NULL,        -- price at time of purchase
+      collected   INTEGER NOT NULL DEFAULT 0  -- ticked off at the door
+    )""")
+
+    # Migrate an older per-event products table to the global one. Earlier builds
+    # scoped products to a single event; stock is now one master figure.
+    pcols = {r["name"] for r in conn.execute("PRAGMA table_info(products)")}
+    if "event_id" in pcols:
+        conn.execute("ALTER TABLE products RENAME TO products_old")
+        conn.execute("""
+        CREATE TABLE products (
+          id          TEXT PRIMARY KEY,
+          name        TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          price       INTEGER NOT NULL,
+          quantity    INTEGER,
+          sold        INTEGER NOT NULL DEFAULT 0,
+          max_each    INTEGER NOT NULL DEFAULT 10,
+          active      INTEGER NOT NULL DEFAULT 1,
+          sort_order  INTEGER NOT NULL DEFAULT 0,
+          created_at  INTEGER NOT NULL
+        )""")
+        conn.execute(
+            "INSERT INTO products (id,name,description,price,quantity,sold,"
+            "max_each,active,sort_order,created_at) "
+            "SELECT id,name,description,price,quantity,sold,max_each,active,"
+            "sort_order,created_at FROM products_old")
+        conn.execute("DROP TABLE products_old")
+
     ocols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
     if "buyer_phone" not in ocols:
         # Phone number, so you can chase a no-show or an abandoned cart.
@@ -336,7 +389,7 @@ class PriceChanged(Exception):
 
 def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
                  currency="GBP", buyer_phone="", discount_code="",
-                 quoted_prices=None, accept_terms=False):
+                 quoted_prices=None, accept_terms=False, products=None):
     """items: list of (ticket_type_id, qty). Validates stock. Returns order id.
 
     Raises ValueError if a ticket type is sold out / lacks stock, or if a supplied
@@ -378,6 +431,28 @@ def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
         if not resolved:
             raise ValueError("No tickets selected")
 
+        # Add-ons (dabbers, vouchers). Stock is GLOBAL — a box of 40 dabbers is one
+        # box, shared across every event, so this can't oversell across nights.
+        resolved_products = []
+        for pid, qty in (products or []):
+            if qty <= 0:
+                continue
+            pr = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+            if pr is None:
+                raise ValueError("Unknown product")
+            if not pr["active"]:
+                raise ValueError(f"{pr['name']} is no longer available.")
+            if qty > pr["max_each"]:
+                raise ValueError(f"Maximum {pr['max_each']} {pr['name']} per booking.")
+            if pr["quantity"] is not None:          # NULL = unlimited
+                left = pr["quantity"] - pr["sold"]
+                if qty > left:
+                    raise ValueError(
+                        f"Only {left} {pr['name']} left." if left > 0
+                        else f"{pr['name']} has sold out.")
+            subtotal += pr["price"] * qty
+            resolved_products.append((pid, qty, pr["price"]))
+
     # If the price moved, don't silently charge more — stop and tell them.
     if price_changes:
         raise PriceChanged(price_changes)
@@ -414,6 +489,12 @@ def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
              accepted_at, terms["version"],
              currency, "pending", provider, now()),
         )
+        for pid, qty, price in resolved_products:
+            conn.execute(
+                "INSERT INTO order_products (id,order_id,product_id,qty,unit_price)"
+                " VALUES (?,?,?,?,?)",
+                (new_id("op"), oid, pid, qty, price),
+            )
         for tt_id, qty, price in resolved:
             conn.execute(
                 "INSERT INTO order_items (id,order_id,ticket_type_id,qty,unit_price)"
@@ -466,6 +547,14 @@ def mark_order_paid(oid):
 
     with cursor() as conn:
         conn.execute("UPDATE orders SET status = 'paid' WHERE id = ?", (oid,))
+
+        # Add-on stock comes off at PAYMENT, same as tickets — so an abandoned
+        # cart doesn't sit on the last dabber.
+        for op in conn.execute("SELECT * FROM order_products WHERE order_id = ?",
+                               (oid,)).fetchall():
+            conn.execute("UPDATE products SET sold = sold + ? WHERE id = ?",
+                         (op["qty"], op["product_id"]))
+
         items = conn.execute("SELECT * FROM order_items WHERE order_id = ?",
                              (oid,)).fetchall()
         created = []
@@ -552,6 +641,9 @@ def event_attendance(event_id):
         p["in_count"] = used
         p["total"] = total
         p["state"] = "in" if used == total else ("partial" if used else "waiting")
+        # What they've bought that you have to physically hand over. Without this
+        # you've taken the money and have no idea who's owed a dabber.
+        p["products"] = products_for_order(p["order_id"])
         out.append(p)
     # Still-to-come first — that's what you're looking for on the night.
     order = {"waiting": 0, "partial": 1, "in": 2}
@@ -966,6 +1058,12 @@ def void_order_tickets(oid, reason="refunded"):
                 "UPDATE ticket_types SET sold = MAX(0, sold - 1) WHERE id = ?",
                 (t["ticket_type_id"],))
             n += 1
+        # Refunding also returns any add-ons to stock.
+        for op in conn.execute("SELECT * FROM order_products WHERE order_id = ?",
+                               (oid,)).fetchall():
+            conn.execute("UPDATE products SET sold = MAX(0, sold - ?) WHERE id = ?",
+                         (op["qty"], op["product_id"]))
+
         conn.execute(
             "UPDATE orders SET status = ?, refunded_at = ? WHERE id = ?",
             ("refunded", now(), oid))
@@ -1196,6 +1294,150 @@ def event_delete_summary(eid):
             "orders": orders, "tickets": tickets,
             "paid_orders": paid["c"], "revenue": paid["v"],
             "has_real_sales": bool(paid["c"])}
+
+
+# ---------------------------------------------------------------------------
+# Products (add-ons: dabbers, drinks vouchers, raffle strips)
+# ---------------------------------------------------------------------------
+def add_product(name, price, quantity=None, description="", max_each=10):
+    """quantity=None means UNLIMITED (drinks vouchers you can always print more of)."""
+    if not name.strip():
+        raise ValueError("Give the product a name.")
+    if price < 0:
+        raise ValueError("Price can't be negative.")
+    if quantity is not None and quantity < 1:
+        raise ValueError("Stock must be at least 1, or leave it blank for unlimited.")
+    pid = new_id("prd")
+    with cursor() as conn:
+        n = conn.execute("SELECT COUNT(*) c FROM products").fetchone()["c"]
+        conn.execute(
+            "INSERT INTO products (id,name,description,price,quantity,"
+            "sold,max_each,active,sort_order,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (pid, name.strip(), description.strip(), price, quantity,
+             0, max(1, max_each), 1, n, now()))
+    return pid
+
+
+def update_product(pid, name=None, price=None, quantity=..., description=None,
+                   max_each=None):
+    """Edit a product. quantity=... means 'leave alone'; None means unlimited."""
+    sets, params = [], []
+    if name is not None:
+        if not name.strip():
+            raise ValueError("Give the product a name.")
+        sets.append("name = ?"); params.append(name.strip())
+    if price is not None:
+        if price < 0:
+            raise ValueError("Price can't be negative.")
+        sets.append("price = ?"); params.append(price)
+    if quantity is not ...:
+        if quantity is not None:
+            if quantity < 0:
+                raise ValueError("Stock can't be negative.")
+            # Don't let you set stock BELOW what you've already sold — that would
+            # show a negative "left" figure and confuse everything downstream.
+            cur = get_product(pid)
+            if cur and quantity < cur["sold"]:
+                raise ValueError(
+                    f"You've already sold {cur['sold']}. Stock can't be lower than that.")
+        sets.append("quantity = ?"); params.append(quantity)
+    if description is not None:
+        sets.append("description = ?"); params.append(description.strip())
+    if max_each is not None:
+        sets.append("max_each = ?"); params.append(max(1, max_each))
+    if not sets:
+        return
+    params.append(pid)
+    with cursor() as conn:
+        conn.execute(f"UPDATE products SET {', '.join(sets)} WHERE id = ?", params)
+
+
+def list_products(only_active=False):
+    """The whole catalogue — the same products are offered at every event."""
+    q = "SELECT * FROM products"
+    if only_active:
+        q += " WHERE active = 1"
+    q += " ORDER BY sort_order, created_at"
+    with cursor() as conn:
+        rows = conn.execute(q).fetchall()
+    return [dict(r) for r in rows]
+
+
+def available_products():
+    """Active products that aren't sold out — what a buyer actually sees."""
+    return [p for p in list_products(only_active=True)
+            if p["quantity"] is None or p["sold"] < p["quantity"]]
+
+
+def product_left(p):
+    """How many left. None = unlimited."""
+    if p["quantity"] is None:
+        return None
+    return max(0, p["quantity"] - p["sold"])
+
+
+def get_product(pid):
+    with cursor() as conn:
+        row = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_product(pid):
+    with cursor() as conn:
+        sold = conn.execute("SELECT sold FROM products WHERE id = ?",
+                            (pid,)).fetchone()
+        if sold and sold["sold"] > 0:
+            # Don't orphan a paid order_products row — people have bought these.
+            raise ValueError("People have already bought this. Turn it off instead.")
+        conn.execute("DELETE FROM products WHERE id = ?", (pid,))
+
+
+def set_product_active(pid, active):
+    with cursor() as conn:
+        conn.execute("UPDATE products SET active = ? WHERE id = ?",
+                     (1 if active else 0, pid))
+
+
+def restock_product(pid, add):
+    """Add to the master stock — you've bought another box of dabbers."""
+    with cursor() as conn:
+        row = conn.execute("SELECT quantity FROM products WHERE id = ?",
+                           (pid,)).fetchone()
+        if row is None or row["quantity"] is None:
+            return          # unlimited: nothing to restock
+        conn.execute("UPDATE products SET quantity = quantity + ? WHERE id = ?",
+                     (max(0, int(add)), pid))
+
+
+def product_sales_by_event(pid):
+    """Where did these actually sell? Useful when stock is shared across nights."""
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT e.title, e.starts_at, SUM(op.qty) AS qty "
+            "FROM order_products op "
+            "JOIN orders o ON o.id = op.order_id "
+            "JOIN events e ON e.id = o.event_id "
+            "WHERE op.product_id = ? AND o.status = 'paid' "
+            "GROUP BY e.id ORDER BY e.starts_at", (pid,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def products_for_order(oid):
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT op.*, p.name, p.description FROM order_products op "
+            "JOIN products p ON p.id = op.product_id "
+            "WHERE op.order_id = ? ORDER BY p.sort_order", (oid,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_product_collected(order_id, product_id, collected=True):
+    """Tick an add-on off at the door — so you know it's been handed over."""
+    with cursor() as conn:
+        conn.execute(
+            "UPDATE order_products SET collected = ? "
+            "WHERE order_id = ? AND product_id = ?",
+            (1 if collected else 0, order_id, product_id))
 
 
 def tickets_for_order(oid):

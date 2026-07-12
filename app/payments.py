@@ -142,7 +142,7 @@ def _stripe_get(path):
         return json.loads(resp.read().decode())
 
 
-def create_checkout(order, items, event, base_url):
+def create_checkout(order, items, event, base_url, addons=None):
     """Return (checkout_url, provider, session_id).
 
     items: list of dicts with keys name, qty, unit_price (pence).
@@ -159,6 +159,18 @@ def create_checkout(order, items, event, base_url):
         },
         "quantity": it["qty"],
     } for it in items]
+
+    # Add-ons (dabbers, vouchers) are charged too — each as its own line, so the
+    # customer's Stripe receipt itemises exactly what they bought.
+    for p in (addons or []):
+        line_items.append({
+            "price_data": {
+                "currency": event["currency"].lower(),
+                "product_data": {"name": p["name"]},
+                "unit_amount": p["unit_price"],
+            },
+            "quantity": p["qty"],
+        })
 
     # The booking fee must be CHARGED, not just displayed. Add it as its own line
     # so it appears on the customer's Stripe receipt exactly as it did at checkout.

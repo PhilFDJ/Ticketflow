@@ -384,7 +384,7 @@ def event_detail(h, eid):
     h.send_html(T.event_detail(event, tts, payments.is_live(), error=err,
                                fee_cfg=db.fee_config(),
                                show_remaining=db.get_setting("show_remaining") == "1",
-                               terms_required=db.terms_required()))
+                               terms_required=db.terms_required(), products=db.available_products()))
 
 
 @route("POST", "/checkout")
@@ -415,18 +415,25 @@ def checkout(h):
     # than silently charging more (see db.PriceChanged).
     quoted = {k[len("quoted_"):]: v for k, v in flat.items() if k.startswith("quoted_")}
     accepted = flat.get("accept_terms") in ("1", "on", "true", "yes")
+
+    # Add-ons: prod_<id> = qty
+    chosen_products = []
+    for pr in db.available_products():
+        q = int(flat.get(f"prod_{pr['id']}", "0") or 0)
+        if q > 0:
+            chosen_products.append((pr["id"], q))
     if not items or not name or not email or not phone:
         return h.send_html(T.event_detail(event, _priced(tts), payments.is_live(),
             error="Please pick at least one ticket and enter your name, email and phone.",
             fee_cfg=db.fee_config(),
             show_remaining=db.get_setting("show_remaining") == "1",
-            terms_required=db.terms_required()), 400)
+            terms_required=db.terms_required(), products=db.available_products()), 400)
     try:
         oid = db.create_order(eid, name, email, items,
                               provider=("stripe" if payments.is_live() else "mock"),
                               currency=event["currency"], buyer_phone=phone,
                               discount_code=dcode, quoted_prices=quoted,
-                              accept_terms=accepted)
+                              accept_terms=accepted, products=chosen_products)
     except db.PriceChanged as pc:
         # Show them the new price and let them decide. Never charge a price they
         # weren't shown.
@@ -435,18 +442,23 @@ def checkout(h):
                                           fee_cfg=db.fee_config(),
                                           show_remaining=db.get_setting("show_remaining") == "1",
                                           terms_required=db.terms_required(),
+                                          products=db.available_products(),
                                           price_notice=pc.changes), 409)
     except ValueError as e:
         return h.send_html(T.event_detail(event, _priced(db.list_ticket_types(eid)),
                                           payments.is_live(),
                                           error=str(e), fee_cfg=db.fee_config(),
                                           show_remaining=db.get_setting("show_remaining") == "1",
-                                          terms_required=db.terms_required()), 400)
+                                          terms_required=db.terms_required(),
+                                          products=db.available_products()), 400)
 
     order = db.get_order(oid)
     line_items = [{"name": db.get_ticket_type(tt)["name"], "qty": q,
                    "unit_price": db.get_ticket_type(tt)["price"]} for tt, q in items]
-    url, provider, session_id = payments.create_checkout(order, line_items, event, h.base_url())
+    addons = [{"name": p["name"], "qty": p["qty"], "unit_price": p["unit_price"]}
+              for p in db.products_for_order(oid)]
+    url, provider, session_id = payments.create_checkout(order, line_items, event,
+                                                         h.base_url(), addons=addons)
     db.set_order_session(oid, session_id, provider)
     if provider == "stripe":
         # Stripe's hosted checkout refuses to render inside an iframe, and this
@@ -1099,6 +1111,95 @@ def admin_terms_save(h):
     h.redirect("/admin/terms?saved=1")
 
 
+@route("GET", "/admin/products")
+def admin_products(h):
+    """The global add-on catalogue — one stock level, offered at every event."""
+    if not require_admin(h):
+        return
+    prods = db.list_products()
+    sales = {p["id"]: db.product_sales_by_event(p["id"]) for p in prods}
+    h.send_html(T.admin_products(prods, sales,
+                                 msg=h.query.get("msg"), err=h.query.get("err")))
+
+
+@route("POST", "/admin/products/add")
+def admin_product_add(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    qty_raw = (flat.get("quantity") or "").strip()
+    try:
+        db.add_product(
+            flat.get("name", ""),
+            int(round(float(flat.get("price", "0")) * 100)),
+            quantity=(int(qty_raw) if qty_raw else None),   # blank = unlimited
+            description=flat.get("description", ""),
+            max_each=int(flat.get("max_each", "10") or 10),
+        )
+    except ValueError as e:
+        return h.redirect(f"/admin/products?err={urllib.parse.quote(str(e))}")
+    h.redirect("/admin/products")
+
+
+@route("POST", "/admin/products/edit")
+def admin_product_edit(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    pid = flat.get("id", "")
+    qty_raw = (flat.get("quantity") or "").strip()
+    unlimited = flat.get("unlimited") == "1"
+    try:
+        db.update_product(
+            pid,
+            name=flat.get("name"),
+            price=int(round(float(flat.get("price", "0")) * 100)),
+            quantity=(None if unlimited else (int(qty_raw) if qty_raw else None)),
+            description=flat.get("description", ""),
+            max_each=int(flat.get("max_each", "10") or 10),
+        )
+    except ValueError as e:
+        return h.redirect(f"/admin/products?err={urllib.parse.quote(str(e))}")
+    h.redirect("/admin/products?msg=Saved")
+
+
+@route("POST", "/admin/products/restock")
+def admin_product_restock(h):
+    """Bought another box — add to the master stock."""
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    try:
+        add = int(flat.get("add", "0") or 0)
+    except ValueError:
+        add = 0
+    if add > 0:
+        db.restock_product(flat.get("id", ""), add)
+        return h.redirect(f"/admin/products?msg={urllib.parse.quote(f'Added {add} to stock.')}")
+    h.redirect("/admin/products")
+
+
+@route("POST", "/admin/products/toggle")
+def admin_product_toggle(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    db.set_product_active(flat.get("id", ""), flat.get("active") == "1")
+    h.redirect("/admin/products")
+
+
+@route("POST", "/admin/products/delete")
+def admin_product_delete(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    try:
+        db.delete_product(flat.get("id", ""))
+    except ValueError as e:
+        return h.redirect(f"/admin/products?err={urllib.parse.quote(str(e))}")
+    h.redirect("/admin/products?msg=Deleted")
+
+
 @route("POST", "/admin/tiers/add")
 def admin_tier_add(h):
     if not require_admin(h):
@@ -1452,6 +1553,24 @@ def admin_sales(h):
     ))
 
 
+@route("POST", "/api/collect")
+def api_collect(h):
+    """Tick an add-on off at the door — you've handed it over."""
+    if not h.is_admin():
+        return h.send_json({"error": "unauthorised"}, 401)
+    try:
+        payload = json.loads(h.read_body().decode() or "{}")
+    except json.JSONDecodeError:
+        return h.send_json({"error": "bad json"}, 400)
+    oid = payload.get("order_id", "")
+    pid = payload.get("product_id", "")
+    got = bool(payload.get("collected", True))
+    if not oid or not pid:
+        return h.send_json({"error": "missing ids"}, 400)
+    db.set_product_collected(oid, pid, got)
+    return h.send_json({"ok": True, "collected": got})
+
+
 @route("GET", r"/api/door/(?P<eid>[\w]+)")
 def api_door_state(h, eid):
     """Current door state, for the live-updating list.
@@ -1646,7 +1765,8 @@ def admin_event(h, eid):
     h.send_html(T.admin_event(event, tts,
                               db.event_stats(eid), db.list_orders(eid),
                               payments.is_live(), venues=db.known_venues(),
-                              tiers_by_tt=tiers))
+                              tiers_by_tt=tiers,
+                              error=h.query.get("err")))
 
 
 @route("POST", "/admin/ticket-types/add")

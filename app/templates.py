@@ -196,7 +196,8 @@ def _maps_link(event):
 
 
 def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None,
-                 show_remaining=False, price_notice=None, terms_required=False):
+                 show_remaining=False, price_notice=None, terms_required=False,
+                 products=None):
     fee_cfg = fee_cfg or {"percent": 0, "fixed": 0, "label": "Booking fee",
                           "enabled": False}
     d = fmt_date(event["starts_at"])
@@ -263,6 +264,46 @@ def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None,
             </div>
             <div>{control}</div>
           </div>""")
+    # Add-ons appear AFTER the tickets, and only once tickets are chosen — it's an
+    # upsell, not a shop. JS reveals it (see recompute).
+    prod_rows = []
+    for p in (products or []):
+        # quantity None = unlimited
+        left = None if p["quantity"] is None else max(0, p["quantity"] - p["sold"])
+        if left is not None and left <= 0:
+            prod_rows.append(f"""
+              <div class="tt-row">
+                <div><h3>{esc(p['name'])}</h3>
+                  <div class="muted small">{money(p['price'], event['currency'])}</div></div>
+                <div><span class="pill bad">Sold out</span></div>
+              </div>""")
+            continue
+        cap = p["max_each"] if left is None else min(left, p["max_each"])
+        desc = (f'<div class="muted small mt1">{esc(p["description"])}</div>'
+                if p["description"] else "")
+        low = (f'· <span class="lowstock">only {left} left</span>'
+               if left is not None and left <= 10 else '')
+        prod_rows.append(f"""
+          <div class="tt-row">
+            <div>
+              <h3>{esc(p['name'])}</h3>
+              <div class="muted small">{money(p['price'], event['currency'])} {low}</div>
+              {desc}
+            </div>
+            <div class="stepper prod" data-price="{p['price']}">
+              <button type="button" onclick="pstep('{p['id']}',-1)">−</button>
+              <input id="p_{p['id']}" name="prod_{p['id']}" value="0" readonly>
+              <button type="button" onclick="pstep('{p['id']}',1)" data-max="{cap}">+</button>
+            </div>
+          </div>""")
+
+    addons_box = ("" if not prod_rows else f"""
+      <div id="addons" class="addons mt3" style="display:none">
+        <h2 class="addons-h mt0">Anything else for the night?</h2>
+        <p class="muted small">Collect these at the door when you arrive.</p>
+        {''.join(prod_rows)}
+      </div>""")
+
     terms_box = ("" if not terms_required else """
         <label class="termsbox mt3">
           <input type="checkbox" name="accept_terms" value="1" id="acceptTerms" required>
@@ -285,6 +326,7 @@ def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None,
       <form method="post" action="/checkout" id="buyform">
         <input type="hidden" name="event_id" value="{esc(event['id'])}">
         {''.join(rows)}
+        {addons_box}
         <div class="row mt2">
           <div><label>Your name</label>
             <input name="buyer_name" required placeholder="Alex Smith"></div>
@@ -305,7 +347,10 @@ def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None,
         <div class="mt3 feebox" id="feebox" style="display:none">
           <div class="feerow"><span class="muted">Tickets</span>
             <span id="sub">{money(0, event['currency'])}</span></div>
-          <div class="feerow"><span class="muted">{esc(fee_cfg['label'])}</span>
+          <div class="feerow" id="extrarow" style="display:none">
+            <span class="muted">Extras</span>
+            <span id="extras">{money(0, event['currency'])}</span></div>
+          <div class="feerow" id="feerow"><span class="muted">{esc(fee_cfg['label'])}</span>
             <span id="fee">{money(0, event['currency'])}</span></div>
         </div>
         {terms_box}
@@ -345,13 +390,32 @@ def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None,
         v = Math.max(0, Math.min(max, v));
         inp.value = v; recompute();
       }}
+      function pstep(id, delta){{
+        const inp = document.getElementById('p_'+id);
+        const plus = inp.nextElementSibling;
+        const max = parseInt(plus.getAttribute('data-max'));
+        let v = parseInt(inp.value||'0') + delta;
+        v = Math.max(0, Math.min(max, v));
+        inp.value = v; recompute();
+      }}
       function recompute(){{
-        let sub = 0, count = 0;
-        document.querySelectorAll('.stepper').forEach(s=>{{
+        // Tickets first — the add-ons box only appears once they've picked one.
+        let tickets = 0, count = 0;
+        document.querySelectorAll('.stepper:not(.prod)').forEach(s=>{{
           const price = parseInt(s.getAttribute('data-price'));
           const q = parseInt(s.querySelector('input').value||'0');
-          sub += price*q; count += q;
+          tickets += price*q; count += q;
         }});
+        let extras = 0;
+        document.querySelectorAll('.stepper.prod').forEach(s=>{{
+          const price = parseInt(s.getAttribute('data-price'));
+          const q = parseInt(s.querySelector('input').value||'0');
+          extras += price*q;
+        }});
+        const box = document.getElementById('addons');
+        if (box) box.style.display = count > 0 ? '' : 'none';
+
+        let sub = tickets + extras;
         // Booking fee: once per booking, not per ticket. Mirrors calc_booking_fee()
         // on the server — the server's figure is authoritative, this is the preview.
         const FEE_PCT = {fee_cfg['percent']}, FEE_FIXED = {fee_cfg['fixed']};
@@ -359,15 +423,21 @@ def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None,
         if(sub > 0 && (FEE_PCT > 0 || FEE_FIXED > 0)){{
           fee = Math.round(sub * FEE_PCT / 100) + FEE_FIXED;
         }}
-        const box = document.getElementById('feebox');
+        const fbox = document.getElementById('feebox');
         const note = document.getElementById('feenote');
-        if(fee > 0){{
-          document.getElementById('sub').textContent = fmt(sub);
+        const erow = document.getElementById('extrarow');
+        const frow = document.getElementById('feerow');
+        // Show the breakdown if there's anything worth breaking down.
+        if(fee > 0 || extras > 0){{
+          document.getElementById('sub').textContent = fmt(tickets);
+          document.getElementById('extras').textContent = fmt(extras);
           document.getElementById('fee').textContent = fmt(fee);
-          if(box) box.style.display = '';
-          if(note) note.style.display = '';
+          if(erow) erow.style.display = extras > 0 ? '' : 'none';
+          if(frow) frow.style.display = fee > 0 ? '' : 'none';
+          if(fbox) fbox.style.display = '';
+          if(note) note.style.display = fee > 0 ? '' : 'none';
         }} else {{
-          if(box) box.style.display = 'none';
+          if(fbox) fbox.style.display = 'none';
           if(note) note.style.display = 'none';
         }}
         document.getElementById('total').textContent = fmt(sub + fee);
@@ -743,6 +813,16 @@ def admin_door(event, parties):
                    f'onclick="doorAdmit(\'{esc(p["order_id"])}\', this)">'
                    f'Admit {remaining}</button>')
 
+        # Add-ons they've paid for and need handing at the door.
+        prods = ""
+        if p.get("products"):
+            chips = "".join(
+                f'<button type="button" class="prodchip {"got" if pr["collected"] else ""}"'
+                f' onclick="collect(\'{esc(p["order_id"])}\',\'{esc(pr["product_id"])}\',this)">'
+                f'{"✓ " if pr["collected"] else ""}{pr["qty"]}× {esc(pr["name"])}</button>'
+                for pr in p["products"])
+            prods = f'<div class="prods">{chips}</div>'
+
         rows.append(f"""
         <div class="party {state}" data-state="{state}" data-oid="{esc(p['order_id'])}"
              data-name="{esc((p['buyer_name'] or '').lower())}">
@@ -750,6 +830,7 @@ def admin_door(event, parties):
             <div class="who">{esc(p['buyer_name'] or 'Unknown')}
               <span class="badgeslot">{badge}</span></div>
             <div class="meta">{kind_str}</div>
+            {prods}
           </div>
           <span class="actslot">{act}</span>
         </div>""")
@@ -870,6 +951,23 @@ def admin_door(event, parties):
     document.addEventListener('visibilitychange', () => {{
       if (!document.hidden) doorPoll();   // catch up the moment you look at it
     }});
+
+    // Tick an extra off as handed over. Optimistic — flip it instantly, the door
+    // is no place to wait for a spinner.
+    async function collect(orderId, productId, el){{
+      const was = el.classList.contains('got');
+      el.classList.toggle('got');
+      el.textContent = (was ? '' : '✓ ') + el.textContent.replace(/^✓ /, '');
+      try {{
+        await fetch('/api/collect', {{
+          method: 'POST', headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{order_id: orderId, product_id: productId,
+                                collected: !was}})
+        }});
+      }} catch (e) {{
+        el.classList.toggle('got');   // put it back if it didn't save
+      }}
+    }}
 
     async function doorAdmit(orderId, btn){{
       btn.disabled = true; btn.textContent = 'Admitting…';
@@ -1161,6 +1259,140 @@ def admin_archive(events, stats_by_event, msg=None, err=None):
     <p class="muted small mt3">Archiving only hides an event. Its tickets stay valid and
       scannable, the door list still works, and the orders and revenue are all still
       counted. Restore it any time.</p>
+    """, admin=True)
+
+
+def admin_products(products, sales_by_product, msg=None, err=None):
+    cards = []
+    for p in products:
+        unlimited = p["quantity"] is None
+        left = None if unlimited else max(0, p["quantity"] - p["sold"])
+
+        if unlimited:
+            stock = '<span class="pill">Unlimited</span>'
+        elif left <= 0:
+            stock = '<span class="pill bad">Sold out</span>'
+        elif left <= 10:
+            stock = f'<span class="pill warn">{left} left</span>'
+        else:
+            stock = f'<span class="pill ok">{left} left</span>'
+
+        state = ("" if p["active"] else '<span class="pill">Off</span>')
+
+        # Where they actually sold — the point of shared stock is that it's spread
+        # across nights, so you want to see that.
+        sales = sales_by_product.get(p["id"], [])
+        if sales:
+            bits = "".join(
+                f'<div class="muted small">{esc(s["title"])} — {s["qty"]}</div>'
+                for s in sales)
+            sold_note = f'<div class="mt2">{bits}</div>'
+        else:
+            sold_note = '<div class="muted small mt2">Not sold yet.</div>'
+
+        restock = ("" if unlimited else f"""
+          <form method="post" action="/admin/products/restock" class="row mt2"
+                style="gap:6px;align-items:center">
+            <input type="hidden" name="id" value="{esc(p['id'])}">
+            <div style="max-width:110px">
+              <input name="add" type="number" min="1" placeholder="+ stock"></div>
+            <div style="flex:0 0 auto">
+              <button class="btn sec sm" type="submit">Restock</button></div>
+          </form>""")
+
+        cards.append(f"""
+        <div class="card mt2"><div class="body">
+          <div class="row" style="justify-content:space-between;align-items:flex-start;gap:12px">
+            <div>
+              <div style="font-weight:700;font-size:17px">{esc(p['name'])} {state}</div>
+              <div class="muted small mt1">{money(p['price'])} · {stock}
+                · sold {p['sold']} · max {p['max_each']} per booking</div>
+              {f'<div class="muted small mt1">{esc(p["description"])}</div>'
+               if p['description'] else ''}
+              {sold_note}
+            </div>
+            <div style="flex:0 0 auto;text-align:right">
+              <form method="post" action="/admin/products/toggle" style="margin:0">
+                <input type="hidden" name="id" value="{esc(p['id'])}">
+                <input type="hidden" name="active" value="{'0' if p['active'] else '1'}">
+                <button class="btn ghost sm" type="submit">
+                  {'Turn off' if p['active'] else 'Turn on'}</button>
+              </form>
+              {restock}
+            </div>
+          </div>
+
+          <details class="mt2">
+            <summary class="muted small" style="cursor:pointer">Edit</summary>
+            <form method="post" action="/admin/products/edit" class="mt2">
+              <input type="hidden" name="id" value="{esc(p['id'])}">
+              <div class="row" style="gap:8px">
+                <div><label>Name</label>
+                  <input name="name" value="{esc(p['name'])}" required></div>
+                <div><label>Price (£)</label>
+                  <input name="price" type="number" min="0" step="0.01"
+                         value="{p['price']/100:.2f}" required></div>
+                <div><label>Total stock</label>
+                  <input name="quantity" type="number" min="0"
+                         value="{'' if unlimited else p['quantity']}"
+                         placeholder="blank = unlimited"></div>
+                <div><label>Max per booking</label>
+                  <input name="max_each" type="number" min="1" value="{p['max_each']}"></div>
+              </div>
+              <div class="mt2"><label>Description <span class="muted small">(optional)</span></label>
+                <input name="description" value="{esc(p['description'])}"></div>
+              <label class="mt2" style="display:flex;align-items:center;gap:8px">
+                <input type="checkbox" name="unlimited" value="1" style="width:auto"
+                       {'checked' if unlimited else ''}>
+                <span class="muted small">Unlimited — never runs out</span>
+              </label>
+              <div class="mt3">
+                <button class="btn sm" type="submit">Save</button>
+                <button class="btn ghost sm" type="submit"
+                        formaction="/admin/products/delete"
+                        onclick="return confirm('Delete {esc(p['name'])}?')"
+                        style="margin-left:8px">Delete</button>
+              </div>
+            </form>
+          </details>
+        </div></div>""")
+
+    return layout("Extras", f"""
+    <a href="/admin" class="muted small">← Dashboard</a>
+    <h1 class="mt2">Extras</h1>
+    <p class="lead">Dabbers, drinks vouchers, raffle strips — offered at
+      <b>every event</b>, from one shared stock.</p>
+    {flash("ok", msg) if msg else ""}
+    {flash("err", err) if err else ""}
+
+    {''.join(cards) if cards else '<p class="muted mt3">Nothing set up yet.</p>'}
+
+    <div class="card mt3"><div class="body">
+      <h2 class="mt0">Add an extra</h2>
+      <form method="post" action="/admin/products/add">
+        <div class="row" style="gap:8px">
+          <div><label>Name</label>
+            <input name="name" placeholder="Bingo dabber" required></div>
+          <div><label>Price (£)</label>
+            <input name="price" type="number" min="0" step="0.01"
+                   placeholder="2.50" required></div>
+          <div><label>Total stock</label>
+            <input name="quantity" type="number" min="1" placeholder="blank = unlimited"></div>
+          <div><label>Max per booking</label>
+            <input name="max_each" type="number" min="1" value="10"></div>
+        </div>
+        <div class="mt2"><label>Description <span class="muted small">(optional)</span></label>
+          <input name="description" placeholder="Collect at the door"></div>
+        <div class="mt3"><button class="btn" type="submit">Add</button></div>
+      </form>
+      <p class="muted small mt2">Leave <b>stock blank</b> for things that never run out
+        (a drinks voucher you can always write another of). Put a number in for things
+        you physically have — a box of 40 dabbers is one box, and it's shared across
+        every night until you restock.</p>
+    </div></div>
+
+    <p class="muted small mt3">Buyers see these <b>after</b> they've picked their tickets,
+      and they show on your door list so you know who's owed what.</p>
     """, admin=True)
 
 
@@ -1652,6 +1884,7 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
       <a class="btn sec" href="/admin/orders?status=pending">🛒 Abandoned carts</a>
       <a class="btn sec" href="/admin/discounts">🏷️ Discount codes</a>
       <a class="btn sec" href="/admin/sales">📈 Sales</a>
+      <a class="btn sec" href="/admin/products">🎯 Extras</a>
       <a class="btn sec" href="/admin/lookup">🔎 Find a customer</a>
       <a class="btn sec" href="/admin/terms">📄 Terms &amp; conditions</a>
       <a class="btn sec" href="/admin/backup"
@@ -1980,6 +2213,7 @@ def admin_event(event, ticket_types, stats, orders, live_mode, error=None, venue
         <div style="flex:0 0 auto"><button class="btn" type="submit">Add</button></div>
       </form>
     </div></div>
+
 
     <div class="card mt3"><div class="body">
       <h2 class="mt0">Recent orders</h2>
