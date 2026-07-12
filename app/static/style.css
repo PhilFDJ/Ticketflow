@@ -290,3 +290,9 @@ footer.site a{color:var(--muted);text-decoration:underline}
 .capbar{height:10px;border-radius:999px;background:var(--panel-2);
   border:1px solid var(--line);overflow:hidden}
 .capfill{height:100%;transition:width .4s}
+
+/* Destructive actions */
+.btn.danger{background:#dc2626;border-color:#dc2626;color:#fff}
+.btn.danger:hover{background:#b91c1c}
+.danger-link{color:#f87171!important}
+.danger-link:hover{background:rgba(220,38,38,.12)}

@@ -1127,6 +1127,77 @@ def busiest_day(eid=None, days=90):
     return best if best and best["tickets"] else None
 
 
+def delete_event(eid, force=False):
+    """PERMANENTLY delete an event and everything attached to it.
+
+    Unlike archiving, this is irreversible: orders, tickets, price tiers and the
+    event itself are gone. Intended for test events you want rid of.
+
+    By default it REFUSES to delete an event with paid orders — that's your sales
+    record, and a mis-click shouldn't destroy it. force=True overrides, but the
+    caller must have explicitly confirmed.
+
+    Returns a dict describing what was deleted.
+    """
+    with cursor() as conn:
+        ev = conn.execute("SELECT * FROM events WHERE id = ?", (eid,)).fetchone()
+        if ev is None:
+            raise ValueError("Unknown event.")
+
+        paid = conn.execute(
+            "SELECT COUNT(*) c, COALESCE(SUM(total),0) v FROM orders "
+            "WHERE event_id = ? AND status IN ('paid','refunded')", (eid,)).fetchone()
+
+        if paid["c"] and not force:
+            raise ValueError(
+                f"This event has {paid['c']} real order(s) worth "
+                f"{paid['v']/100:.2f}. Deleting it would destroy that sales record.")
+
+        tt_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM ticket_types WHERE event_id = ?", (eid,))]
+        order_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM orders WHERE event_id = ?", (eid,))]
+
+        n_tickets = conn.execute(
+            "SELECT COUNT(*) c FROM tickets WHERE event_id = ?", (eid,)).fetchone()["c"]
+
+        # Children first, then the event.
+        conn.execute("DELETE FROM tickets WHERE event_id = ?", (eid,))
+        for oid in order_ids:
+            conn.execute("DELETE FROM order_items WHERE order_id = ?", (oid,))
+            conn.execute("DELETE FROM discount_uses WHERE order_id = ?", (oid,))
+        conn.execute("DELETE FROM orders WHERE event_id = ?", (eid,))
+        for ttid in tt_ids:
+            conn.execute("DELETE FROM price_tiers WHERE ticket_type_id = ?", (ttid,))
+        conn.execute("DELETE FROM ticket_types WHERE event_id = ?", (eid,))
+        conn.execute("DELETE FROM discounts WHERE event_id = ?", (eid,))
+        conn.execute("DELETE FROM settings WHERE key LIKE ?", (f"capalert:{eid}:%",))
+        conn.execute("DELETE FROM events WHERE id = ?", (eid,))
+
+    return {"title": ev["title"], "orders": len(order_ids),
+            "tickets": n_tickets, "paid_orders": paid["c"],
+            "revenue": paid["v"]}
+
+
+def event_delete_summary(eid):
+    """What WOULD be destroyed — shown before you confirm."""
+    with cursor() as conn:
+        ev = conn.execute("SELECT * FROM events WHERE id = ?", (eid,)).fetchone()
+        if ev is None:
+            return None
+        paid = conn.execute(
+            "SELECT COUNT(*) c, COALESCE(SUM(total),0) v FROM orders "
+            "WHERE event_id = ? AND status IN ('paid','refunded')", (eid,)).fetchone()
+        orders = conn.execute(
+            "SELECT COUNT(*) c FROM orders WHERE event_id = ?", (eid,)).fetchone()["c"]
+        tickets = conn.execute(
+            "SELECT COUNT(*) c FROM tickets WHERE event_id = ?", (eid,)).fetchone()["c"]
+    return {"id": eid, "title": ev["title"], "starts_at": ev["starts_at"],
+            "orders": orders, "tickets": tickets,
+            "paid_orders": paid["c"], "revenue": paid["v"],
+            "has_real_sales": bool(paid["c"])}
+
+
 def tickets_for_order(oid):
     with cursor() as conn:
         rows = conn.execute(

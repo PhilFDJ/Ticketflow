@@ -1056,7 +1056,66 @@ def admin_discounts(discounts, events, error=None, fee_cfg=None, saved=False,
     """, admin=True)
 
 
-def admin_archive(events, stats_by_event):
+def admin_delete_confirm(info, error=None):
+    real = info["has_real_sales"]
+
+    if real:
+        warn = f"""
+        <div class="flash err">
+          <b>This event has {info['paid_orders']} real order(s)
+            worth {money(info['revenue'])}.</b>
+          <p style="margin:8px 0 0">Deleting it destroys that sales record — the
+            orders, the customers' details, and their tickets. There is no undo and
+            no backup unless you've downloaded one.</p>
+          <p style="margin:8px 0 0">If you only want it out of the way,
+            <b>archiving</b> already does that — the event stays hidden but the
+            records survive.</p>
+        </div>
+        <div class="card mt3"><div class="body">
+          <p>To go ahead anyway, type the event's name exactly:</p>
+          <p class="muted small">{esc(info['title'])}</p>
+          <form method="post" action="/admin/events/delete" class="mt2">
+            <input type="hidden" name="id" value="{esc(info['id'])}">
+            <input name="confirm_title" required autocomplete="off"
+                   placeholder="Type the event name to confirm">
+            <button class="btn danger full mt3" type="submit">
+              Permanently delete this event</button>
+          </form>
+        </div></div>"""
+    else:
+        warn = f"""
+        <div class="flash info">
+          No money was ever taken for this event, so nothing of value is lost.
+          Looks like a test event.
+        </div>
+        <form method="post" action="/admin/events/delete" class="mt3">
+          <input type="hidden" name="id" value="{esc(info['id'])}">
+          <button class="btn danger" type="submit">Delete it permanently</button>
+          <a class="btn sec" href="/admin/archive" style="margin-left:8px">Cancel</a>
+        </form>"""
+
+    return layout("Delete event", f"""
+    <a href="/admin/archive" class="muted small">← Archive</a>
+    <h1 class="mt2">Delete “{esc(info['title'])}”?</h1>
+    {flash("err", "The name didn't match. Nothing was deleted.") if error else ""}
+
+    <div class="card mt2"><div class="body">
+      <h2 class="mt0">What would be destroyed</h2>
+      <table class="mt2">
+        <tr><td class="muted">Orders</td><td><b>{info['orders']}</b></td></tr>
+        <tr><td class="muted">Tickets</td><td><b>{info['tickets']}</b></td></tr>
+        <tr><td class="muted">Paid orders</td>
+          <td><b>{info['paid_orders']}</b>
+            {f'· {money(info["revenue"])}' if info['revenue'] else ''}</td></tr>
+      </table>
+      <p class="muted small mt2">This cannot be undone.</p>
+    </div></div>
+
+    {warn}
+    """, admin=True)
+
+
+def admin_archive(events, stats_by_event, msg=None, err=None):
     rows = []
     total = 0
     for e in events:
@@ -1078,6 +1137,9 @@ def admin_archive(events, stats_by_event):
               <input type="hidden" name="back" value="/admin/archive">
               <button class="btn ghost sm" type="submit">Restore</button>
             </form>
+            <a class="btn ghost sm danger-link"
+               href="/admin/events/delete?id={esc(e['id'])}"
+               title="Permanently delete. Cannot be undone.">Delete</a>
           </td>
         </tr>""")
 
@@ -1085,6 +1147,8 @@ def admin_archive(events, stats_by_event):
     <a href="/admin" class="muted small">← Dashboard</a>
     <h1 class="mt2">Archive</h1>
     <p class="lead">Past events, out of the way but not gone.</p>
+    {flash("ok", msg) if msg else ""}
+    {flash("err", err) if err else ""}
 
     <div class="card mt2"><div class="body">
       {'<table><thead><tr><th>Event</th><th>Sold</th><th>Scanned</th><th>Revenue</th>'

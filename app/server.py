@@ -1066,7 +1066,8 @@ def admin_archive(h):
         return
     events = db.list_events(archived=True)
     stats = {e["id"]: db.event_stats(e["id"]) for e in events}
-    h.send_html(T.admin_archive(events, stats))
+    h.send_html(T.admin_archive(events, stats,
+                                msg=h.query.get("msg"), err=h.query.get("err")))
 
 
 @route("GET", "/terms")
@@ -1379,6 +1380,54 @@ def admin_event_csv(h, eid):
     h.send_header("Content-Length", str(len(data)))
     h.end_headers()
     h.wfile.write(data)
+
+
+@route("GET", "/admin/events/delete")
+def admin_event_delete_confirm(h):
+    """Show exactly what would be destroyed, before anything is."""
+    if not require_admin(h):
+        return
+    eid = h.query.get("id", "")
+    info = db.event_delete_summary(eid)
+    if not info:
+        return h.redirect("/admin/archive")
+    h.send_html(T.admin_delete_confirm(info, error=h.query.get("err")))
+
+
+@route("POST", "/admin/events/delete")
+def admin_event_delete(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    eid = flat.get("id", "")
+    info = db.event_delete_summary(eid)
+    if not info:
+        return h.redirect("/admin/archive?err=Unknown+event")
+
+    # Only allow deleting ARCHIVED events. Forces you to archive first, which is a
+    # deliberate speed bump in front of an irreversible action.
+    ev = db.get_event(eid)
+    if not ev.get("archived_at"):
+        return h.redirect("/admin/archive?err="
+                          + urllib.parse.quote("Archive the event before deleting it."))
+
+    # An event with real sales needs the title typed out. A confirm() dialog is too
+    # easy to click through when you're tired.
+    force = False
+    if info["has_real_sales"]:
+        typed = (flat.get("confirm_title") or "").strip()
+        if typed != info["title"]:
+            return h.redirect(f"/admin/events/delete?id={urllib.parse.quote(eid)}&err=1")
+        force = True
+
+    try:
+        res = db.delete_event(eid, force=force)
+    except ValueError as e:
+        return h.redirect("/admin/archive?err=" + urllib.parse.quote(str(e)))
+
+    msg = (f"Deleted “{res['title']}” — {res['tickets']} ticket(s) "
+           f"and {res['orders']} order(s) permanently removed.")
+    h.redirect("/admin/archive?msg=" + urllib.parse.quote(msg))
 
 
 @route("GET", "/admin/sales")
