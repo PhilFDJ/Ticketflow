@@ -125,11 +125,19 @@ def flash(kind, msg):
 # ---------------------------------------------------------------------------
 # Public pages
 # ---------------------------------------------------------------------------
-def home(events, ticket_types_by_event, live_mode, embed=False):
-    banner = ("" if live_mode else
-              '<div class="banner">💳 <b>Mock payment mode</b> — no Stripe key set, '
-              'so checkout is simulated and no real card is charged. '
-              'Add a Stripe test key to enable real test-mode payments.</div>')
+def home(events, ticket_types_by_event, live_mode, embed=False, pay_mode=None):
+    # Only warn when checkout ISN'T taking real money. When live, say nothing —
+    # a "test mode" notice on a real ticket page would scare buyers off.
+    if pay_mode is None:
+        pay_mode = "test" if live_mode else "mock"
+    if pay_mode == "live":
+        banner = ""
+    elif pay_mode == "test":
+        banner = ('<div class="banner">💳 <b>Stripe test mode</b> — cards are not '
+                  'really charged. Switch to a live key before selling.</div>')
+    else:
+        banner = ('<div class="banner">💳 <b>Mock payment mode</b> — no Stripe key set, '
+                  'so checkout is simulated and no real card is charged.</div>')
     cards = []
     for e in events:
         tts = ticket_types_by_event.get(e["id"], [])
@@ -227,6 +235,17 @@ def event_detail(event, ticket_types, live_mode, error=None):
             <input name="buyer_name" required placeholder="Alex Smith"></div>
           <div><label>Email</label>
             <input name="buyer_email" type="email" required placeholder="alex@email.com"></div>
+        </div>
+        <div class="mt2">
+          <label>Phone number</label>
+          <input name="buyer_phone" type="tel" required placeholder="07700 900123"
+                 autocomplete="tel">
+          <p class="muted small mt1">So we can reach you about this booking.</p>
+        </div>
+        <div class="mt2">
+          <label>Discount code <span class="muted small">(optional)</span></label>
+          <input name="discount_code" placeholder="e.g. EARLYBIRD"
+                 style="text-transform:uppercase" autocomplete="off">
         </div>
         <div class="mt3" style="display:flex;align-items:center;justify-content:space-between">
           <div class="muted">Total <span id="total" style="color:var(--ink);font-size:20px;font-weight:700">{money(0, event['currency'])}</span></div>
@@ -664,6 +683,15 @@ def admin_door(event, parties):
       <button          data-f="waiting" onclick="doorFilter(this,'waiting')">Still to come</button>
       <button          data-f="in"      onclick="doorFilter(this,'in')">Arrived</button>
     </div>
+
+    <div class="row mt2" style="gap:8px;flex-wrap:wrap">
+      <a class="btn sec sm" href="/admin/events/{esc(event['id'])}/sheet" target="_blank">
+        🖨️ Printable door list</a>
+      <a class="btn sec sm" href="/admin/events/{esc(event['id'])}/report.csv">
+        ⤓ Download CSV</a>
+    </div>
+    <p class="muted small mt1">Print the door list before the night — it's your backup
+      if the scanner or the wifi lets you down.</p>
     <input id="doorSearch" placeholder="Search a name…" oninput="doorSearchFn()" class="mt1">
 
     <div id="doorList" class="mt2">
@@ -710,6 +738,258 @@ def admin_door(event, parties):
     return layout("On the door", body, admin=True)
 
 
+def admin_discounts(discounts, events, error=None):
+    rows = []
+    for d in discounts:
+        if d["kind"] == "percent":
+            worth = f"{d['value']}% off"
+        else:
+            worth = f"{money(d['value'])} off"
+
+        # Usage
+        if d["max_uses"]:
+            used = f"{d['used_count']} / {d['max_uses']}"
+            exhausted = d["used_count"] >= d["max_uses"]
+        else:
+            used = f"{d['used_count']} · unlimited"
+            exhausted = False
+
+        expired = bool(d["expires_at"]) and time.time() > d["expires_at"]
+        expiry = (time.strftime("%d %b %Y", time.localtime(int(d["expires_at"])))
+                  if d["expires_at"] else "Never")
+
+        if not d["active"]:
+            state = '<span class="pill">Off</span>'
+        elif expired:
+            state = '<span class="pill warn">Expired</span>'
+        elif exhausted:
+            state = '<span class="pill warn">Used up</span>'
+        else:
+            state = '<span class="pill ok">Live</span>'
+
+        scope = esc(d["event_title"]) if d["event_id"] else "All events"
+
+        rows.append(f"""
+        <tr>
+          <td><code style="font-size:14px;font-weight:700">{esc(d['code'])}</code></td>
+          <td>{worth}</td>
+          <td class="muted small">{scope}</td>
+          <td class="muted small">{used}</td>
+          <td class="muted small">{expiry}</td>
+          <td>{state}</td>
+          <td style="white-space:nowrap">
+            <form method="post" action="/admin/discounts/toggle" style="display:inline">
+              <input type="hidden" name="id" value="{esc(d['id'])}">
+              <input type="hidden" name="active" value="{'0' if d['active'] else '1'}">
+              <button class="btn ghost sm" type="submit">
+                {'Turn off' if d['active'] else 'Turn on'}</button>
+            </form>
+            <form method="post" action="/admin/discounts/delete" style="display:inline"
+                  onsubmit="return confirm('Delete {esc(d['code'])}? Orders that already used it keep their discount.')">
+              <input type="hidden" name="id" value="{esc(d['id'])}">
+              <button class="btn ghost sm" type="submit">Delete</button>
+            </form>
+          </td>
+        </tr>""")
+
+    event_opts = "".join(
+        f'<option value="{esc(e["id"])}">{esc(e["title"])}</option>' for e in events)
+
+    return layout("Discount codes", f"""
+    <a href="/admin" class="muted small">← Dashboard</a>
+    <h1 class="mt2">Discount codes</h1>
+    {flash("err", error) if error else ""}
+
+    <div class="card mt2"><div class="body">
+      {'<table><thead><tr><th>Code</th><th>Worth</th><th>Valid for</th><th>Used</th>'
+       '<th>Expires</th><th></th><th></th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table>'
+       if rows else '<p class="muted">No discount codes yet.</p>'}
+    </div></div>
+
+    <div class="card mt3"><div class="body">
+      <h2 class="mt0">Create a code</h2>
+      <form method="post" action="/admin/discounts/new">
+        <div class="row mt2">
+          <div><label>Code</label>
+            <input name="code" required placeholder="EARLYBIRD"
+                   style="text-transform:uppercase"></div>
+          <div><label>Type</label>
+            <select name="kind" id="dkind" onchange="dhint()">
+              <option value="percent">Percentage off</option>
+              <option value="fixed">Fixed amount off</option>
+            </select></div>
+          <div><label>Value</label>
+            <input name="value" required placeholder="10" id="dval">
+            <p class="muted small mt1" id="dhint">10 = 10% off</p></div>
+        </div>
+        <div class="row mt2">
+          <div><label>Valid for</label>
+            <select name="event_id">
+              <option value="">All events</option>
+              {event_opts}
+            </select></div>
+          <div><label>Usage limit <span class="muted small">(blank = unlimited)</span></label>
+            <input name="max_uses" type="number" min="1" placeholder="20"></div>
+          <div><label>Expires <span class="muted small">(blank = never)</span></label>
+            <input name="expires_at" type="date"></div>
+        </div>
+        <div class="mt3"><button class="btn" type="submit">Create code</button></div>
+      </form>
+    </div></div>
+
+    <script>
+      function dhint(){{
+        var k = document.getElementById('dkind').value;
+        var h = document.getElementById('dhint');
+        var v = document.getElementById('dval');
+        if(k === 'percent'){{ h.textContent = '10 = 10% off'; v.placeholder = '10'; }}
+        else {{ h.textContent = '2.50 = £2.50 off'; v.placeholder = '2.50'; }}
+      }}
+    </script>
+    """, admin=True)
+
+
+def admin_orders(orders, summary, status, search):
+    rows = []
+    for o in orders:
+        paid = o["status"] == "paid"
+        when = time.strftime("%d %b, %H:%M", time.localtime(int(o["created_at"])))
+        qty = o["ticket_count"] or o["item_qty"] or 0
+        badge = ('<span class="pill ok">Paid</span>' if paid
+                 else '<span class="pill warn">Abandoned</span>')
+        phone = esc(o["buyer_phone"] or "—")
+        rows.append(f"""
+        <tr class="{'' if paid else 'abandoned'}">
+          <td class="muted small">{when}</td>
+          <td>
+            <div style="font-weight:600">{esc(o['buyer_name'])}</div>
+            <div class="muted small">
+              <a href="mailto:{esc(o['buyer_email'])}">{esc(o['buyer_email'])}</a>
+            </div>
+            <div class="muted small"><a href="tel:{phone}">{phone}</a></div>
+          </td>
+          <td class="muted small">{esc(o['event_title'])}</td>
+          <td>{qty}</td>
+          <td>{money(o['total'], o['currency'])}</td>
+          <td>{badge}</td>
+        </tr>""")
+
+    def tab(label, val):
+        on = "on" if status == val else ""
+        q = f"?status={val}" if val else ""
+        return f'<a class="att-tabs-link {on}" href="/admin/orders{q}">{label}</a>'
+
+    return layout("Orders", f"""
+    <a href="/admin" class="muted small">← Dashboard</a>
+    <h1 class="mt2">All orders</h1>
+    <p class="lead">Every booking across every event, and the carts people didn't finish.</p>
+
+    <div class="grid cols-3 mt2">
+      <div class="stat"><div class="n">{summary['paid_count']}</div>
+        <div class="l">Paid orders</div></div>
+      <div class="stat"><div class="n">{money(summary['revenue'])}</div>
+        <div class="l">Revenue</div></div>
+      <div class="stat"><div class="n">{summary['abandoned_count']}</div>
+        <div class="l">Abandoned carts · {money(summary['abandoned_value'])} lost</div></div>
+    </div>
+
+    <div class="att-tabs mt3">
+      {tab("Everything", "")}
+      {tab("Paid", "paid")}
+      {tab("Abandoned carts", "pending")}
+    </div>
+
+    <form method="get" action="/admin/orders" class="row mt2" style="gap:8px">
+      <input type="hidden" name="status" value="{esc(status)}">
+      <input name="q" value="{esc(search)}" placeholder="Search name, email, phone or event…">
+      <button class="btn sec" style="flex:0 0 auto" type="submit">Search</button>
+      <a class="btn sec" style="flex:0 0 auto"
+         href="/admin/orders.csv{f'?status={status}' if status else ''}">⤓ CSV</a>
+    </form>
+
+    <div class="card mt2"><div class="body">
+      {'<table><thead><tr><th>When</th><th>Customer</th><th>Event</th><th>Tickets</th>'
+       '<th>Total</th><th>Status</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table>'
+       if rows else '<p class="muted">No orders yet.</p>'}
+    </div></div>
+
+    <p class="muted small mt2">An <b>abandoned cart</b> is someone who filled in their details
+      and started checkout but never paid — so you have their email and phone, and can chase them.</p>
+    """, admin=True)
+
+
+def door_sheet(event, parties):
+    """Printable door list. White paper, black ink, big tick boxes.
+
+    Deliberately NOT the dark site theme — this is meant to be printed and used
+    with a pen at the door when the scanner won't play ball.
+    """
+    total_tickets = sum(p["total"] for p in parties)
+    rows = []
+    for p in parties:
+        for i, t in enumerate(p["tickets"]):
+            # Only name the buyer on the first row of a party, so a group of 4
+            # reads as one block of four tick boxes rather than four separate people.
+            name = esc(p["buyer_name"] or "Unknown") if i == 0 else ""
+            party = f'<span class="pty">party of {p["total"]}</span>' if (i == 0 and p["total"] > 1) else ""
+            already = ' <span class="wasin">(scanned in)</span>' if t["status"] == "used" else ""
+            rows.append(f"""
+            <tr>
+              <td class="tick"></td>
+              <td class="nm">{name} {party}</td>
+              <td class="tt">{esc(t['ticket_name'])}</td>
+              <td class="cd">{esc(t['code'][-8:])}{already}</td>
+            </tr>""")
+
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Door list — {esc(event['title'])}</title>
+<style>
+  /* Standalone page: printed, not browsed. Light theme regardless of the site. */
+  body{{font-family:-apple-system,Helvetica,Arial,sans-serif;color:#000;background:#fff;
+    margin:0;padding:22px;font-size:13px}}
+  h1{{font-size:20px;margin:0 0 2px}}
+  .sub{{color:#444;margin:0 0 4px}}
+  .meta{{color:#444;font-size:12px;margin:0 0 14px}}
+  table{{width:100%;border-collapse:collapse}}
+  th{{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;
+    color:#555;border-bottom:2px solid #000;padding:6px 6px}}
+  td{{padding:9px 6px;border-bottom:1px solid #ccc;vertical-align:middle}}
+  .tick{{width:26px}}
+  .tick::before{{content:"";display:block;width:17px;height:17px;border:2px solid #000;
+    border-radius:3px}}
+  .nm{{font-weight:600;font-size:14px}}
+  .pty{{font-weight:400;color:#666;font-size:11px}}
+  .tt{{color:#333;width:130px}}
+  .cd{{font-family:ui-monospace,Menlo,monospace;color:#333;width:150px;font-size:12px}}
+  .wasin{{color:#0a7a34;font-weight:600;font-family:inherit;font-size:11px}}
+  tr{{break-inside:avoid;page-break-inside:avoid}}
+  .noprint{{margin-bottom:16px}}
+  @media print{{ .noprint{{display:none}} body{{padding:0}} @page{{margin:12mm}} }}
+</style>
+</head><body>
+  <div class="noprint">
+    <button onclick="window.print()"
+      style="font-size:15px;padding:10px 18px;cursor:pointer">🖨️ Print this list</button>
+    <a href="/admin/events/{esc(event['id'])}/door" style="margin-left:12px">← Back</a>
+  </div>
+
+  <h1>{esc(event['title'])}</h1>
+  <p class="sub">{esc(event['venue'])} · {esc(fmt_date(event['starts_at']))}</p>
+  <p class="meta">{total_tickets} ticket{'s' if total_tickets != 1 else ''} sold ·
+     {len(parties)} booking{'s' if len(parties) != 1 else ''} ·
+     printed {time.strftime('%d/%m/%Y %H:%M')}</p>
+
+  <table>
+    <thead><tr>
+      <th></th><th>Name</th><th>Ticket</th><th>Code (last 8)</th>
+    </tr></thead>
+    <tbody>{''.join(rows) if rows else '<tr><td colspan="4">No tickets sold.</td></tr>'}</tbody>
+  </table>
+</body></html>"""
+
+
 def admin_login(error=None):
     err = flash("err", error) if error else ""
     return layout("Organiser sign in", f"""
@@ -729,7 +1009,7 @@ def admin_login(error=None):
     </div>""")
 
 
-def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from="", mail_reply="", wallet_on=False, wallet_problem=""):
+def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from="", mail_reply="", wallet_on=False, wallet_problem="", pay_mode="mock"):
     rows = []
     tot_rev = 0
     for e in events:
@@ -747,8 +1027,14 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
     table = (f"<table><thead><tr><th>Event</th><th>Status</th><th>Sold</th>"
              f"<th>Scanned</th><th>Revenue</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"
              if rows else '<p class="muted">No events yet — create your first below.</p>')
-    mode = ('<span class="pill ok">Stripe test mode</span>' if live_mode
-            else '<span class="pill warn">Mock payments</span>')
+    # Three genuinely different states — conflating test with live is how someone
+    # ends up taking real money while thinking they're testing.
+    if pay_mode == "live":
+        mode = '<span class="pill ok">● LIVE — real payments</span>'
+    elif pay_mode == "test":
+        mode = '<span class="pill warn">Stripe TEST mode — no real money</span>'
+    else:
+        mode = '<span class="pill warn">Mock payments — Stripe not connected</span>'
     mail_badge = ('<span class="pill ok">On</span>' if mail_on
                   else '<span class="pill bad">Off</span>')
     wallet_badge = ('<span class="pill ok">On</span>' if wallet_on
@@ -781,6 +1067,12 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
       <div class="stat"><div class="n">{mode}</div><div class="l">Payments</div></div>
     </div>
     <div class="card mt3"><div class="body">{table}</div></div>
+
+    <div class="row mt3" style="gap:8px;flex-wrap:wrap">
+      <a class="btn" href="/admin/orders">📋 All orders &amp; customers</a>
+      <a class="btn sec" href="/admin/orders?status=pending">🛒 Abandoned carts</a>
+      <a class="btn sec" href="/admin/discounts">🏷️ Discount codes</a>
+    </div>
 
     <div class="card mt3"><div class="body">
       <h2 class="mt0">Apple Wallet {wallet_badge}</h2>

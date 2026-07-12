@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -330,7 +331,8 @@ class Handler(BaseHTTPRequestHandler):
 def home(h):
     events = db.list_events(only_published=True)
     tts = {e["id"]: db.list_ticket_types(e["id"]) for e in events}
-    h.send_html(T.home(events, tts, payments.is_live()))
+    h.send_html(T.home(events, tts, payments.is_live(),
+                       pay_mode=payments.mode_label()))
 
 
 @route("GET", "/embed")
@@ -340,7 +342,8 @@ def home_embed(h):
     background, and it posts its height to the parent so the frame can resize."""
     events = db.list_events(only_published=True)
     tts = {e["id"]: db.list_ticket_types(e["id"]) for e in events}
-    h.send_html(T.home(events, tts, payments.is_live(), embed=True))
+    h.send_html(T.home(events, tts, payments.is_live(), embed=True,
+                       pay_mode=payments.mode_label()))
 
 
 @route("GET", r"/events/(?P<eid>[\w]+)")
@@ -368,13 +371,16 @@ def checkout(h):
             items.append((t["id"], qty))
     name = flat.get("buyer_name", "").strip()
     email = flat.get("buyer_email", "").strip()
-    if not items or not name or not email:
+    phone = flat.get("buyer_phone", "").strip()
+    dcode = flat.get("discount_code", "").strip()
+    if not items or not name or not email or not phone:
         return h.send_html(T.event_detail(event, tts, payments.is_live(),
-            error="Please pick at least one ticket and enter your details."), 400)
+            error="Please pick at least one ticket and enter your name, email and phone."), 400)
     try:
         oid = db.create_order(eid, name, email, items,
                               provider=("stripe" if payments.is_live() else "mock"),
-                              currency=event["currency"])
+                              currency=event["currency"], buyer_phone=phone,
+                              discount_code=dcode)
     except ValueError as e:
         return h.send_html(T.event_detail(event, tts, payments.is_live(), error=str(e)), 400)
 
@@ -585,6 +591,185 @@ def admin_test_email(h):
     })
 
 
+@route("GET", "/admin/discounts")
+def admin_discounts(h):
+    if not require_admin(h):
+        return
+    h.send_html(T.admin_discounts(db.list_discounts(), db.list_events()))
+
+
+@route("POST", "/admin/discounts/new")
+def admin_discounts_new(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    kind = flat.get("kind", "percent")
+    raw_value = flat.get("value", "").strip()
+    expires_raw = flat.get("expires_at", "").strip()
+    max_uses = flat.get("max_uses", "").strip()
+
+    try:
+        if kind == "percent":
+            value = int(float(raw_value))
+        else:
+            value = int(round(float(raw_value) * 100))   # £ -> pence
+    except ValueError:
+        return h.send_html(T.admin_discounts(db.list_discounts(), db.list_events(),
+                                             error="Enter a number for the value."), 400)
+
+    expires_at = None
+    if expires_raw:
+        try:
+            # An expiry date means end-of-day, not midnight-that-morning.
+            t = time.strptime(expires_raw, "%Y-%m-%d")
+            expires_at = int(time.mktime((t.tm_year, t.tm_mon, t.tm_mday,
+                                          23, 59, 59, 0, 0, -1)))
+        except ValueError:
+            return h.send_html(T.admin_discounts(db.list_discounts(), db.list_events(),
+                                                 error="Invalid expiry date."), 400)
+
+    try:
+        db.create_discount(
+            flat.get("code", ""), kind, value,
+            event_id=flat.get("event_id") or None,
+            max_uses=int(max_uses) if max_uses else None,
+            expires_at=expires_at,
+        )
+    except ValueError as e:
+        return h.send_html(T.admin_discounts(db.list_discounts(), db.list_events(),
+                                             error=str(e)), 400)
+    h.redirect("/admin/discounts")
+
+
+@route("POST", "/admin/discounts/toggle")
+def admin_discounts_toggle(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    did = flat.get("id", "")
+    on = flat.get("active") == "1"
+    db.set_discount_active(did, on)
+    h.redirect("/admin/discounts")
+
+
+@route("POST", "/admin/discounts/delete")
+def admin_discounts_delete(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    db.delete_discount(flat.get("id", ""))
+    h.redirect("/admin/discounts")
+
+
+@route("GET", "/admin/orders")
+def admin_orders(h):
+    """Every order across every event, in one place — including abandoned carts."""
+    if not require_admin(h):
+        return
+    status = h.query.get("status", "")
+    if status not in ("paid", "pending"):
+        status = ""
+    search = (h.query.get("q") or "").strip()
+    orders = db.all_orders(status=status or None, search=search)
+    h.send_html(T.admin_orders(orders, db.orders_summary(), status, search))
+
+
+@route("GET", "/admin/orders.csv")
+def admin_orders_csv(h):
+    """All orders as CSV — customers, contact details, and abandoned carts."""
+    if not require_admin(h):
+        return
+    status = h.query.get("status", "")
+    if status not in ("paid", "pending"):
+        status = ""
+
+    import csv
+    import io as _io
+    buf = _io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Date", "Event", "Name", "Email", "Phone", "Tickets",
+                "Total", "Status"])
+    for o in db.all_orders(status=status or None, search="", limit=5000):
+        w.writerow([
+            time.strftime("%d/%m/%Y %H:%M", time.localtime(int(o["created_at"]))),
+            o["event_title"], o["buyer_name"], o["buyer_email"],
+            o["buyer_phone"] or "",
+            o["ticket_count"] or o["item_qty"] or 0,
+            f"{o['total']/100:.2f}",
+            "PAID" if o["status"] == "paid" else "ABANDONED",
+        ])
+    data = buf.getvalue().encode("utf-8-sig")
+    h.send_response(200)
+    h.send_header("Content-Type", "text/csv; charset=utf-8")
+    h.send_header("Content-Disposition", 'attachment; filename="orders.csv"')
+    h.send_header("Content-Length", str(len(data)))
+    h.end_headers()
+    h.wfile.write(data)
+
+
+@route("GET", r"/admin/events/(?P<eid>[\w]+)/sheet")
+def admin_door_sheet(h, eid):
+    """A printable door list — the paper backup if the scanner or the wifi dies.
+
+    Sorted by surname-ish (whatever they typed), with tick boxes and ticket codes,
+    so someone can be found and checked off by hand under pressure.
+    """
+    if not require_admin(h):
+        return
+    event = db.get_event(eid)
+    if not event:
+        return h.send_html(T.layout("Error", "<h1>Unknown event</h1>"), 404)
+    parties = db.event_attendance(eid)
+    # On paper you look people up by NAME, not by arrival status.
+    parties = sorted(parties, key=lambda p: (p["buyer_name"] or "").lower())
+    h.send_html(T.door_sheet(event, parties))
+
+
+@route("GET", r"/admin/events/(?P<eid>[\w]+)/report.csv")
+def admin_event_csv(h, eid):
+    """Every ticket for an event, as CSV — a paper/spreadsheet backup for the door
+    in case the scanner or the network lets you down on the night."""
+    if not require_admin(h):
+        return
+    event = db.get_event(eid)
+    if not event:
+        return h.send_html(T.layout("Error", "<h1>Unknown event</h1>"), 404)
+
+    import csv
+    import io as _io
+    buf = _io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Name", "Email", "Ticket type", "Ticket code",
+                "Status", "Checked in at", "Order ref", "Party size"])
+
+    for p in db.event_attendance(eid):
+        for t in p["tickets"]:
+            scanned = ""
+            if t["scanned_at"]:
+                scanned = time.strftime("%d/%m/%Y %H:%M",
+                                        time.localtime(int(t["scanned_at"])))
+            w.writerow([
+                p["buyer_name"] or "",
+                p["buyer_email"] or "",
+                t["ticket_name"] or "",
+                t["code"],
+                "IN" if t["status"] == "used" else "not arrived",
+                scanned,
+                p["order_id"],
+                p["total"],
+            ])
+
+    data = buf.getvalue().encode("utf-8-sig")   # BOM so Excel opens it cleanly
+    safe = re.sub(r"[^\w\-]+", "-", event["title"]).strip("-").lower()
+    h.send_response(200)
+    h.send_header("Content-Type", "text/csv; charset=utf-8")
+    h.send_header("Content-Disposition",
+                  f'attachment; filename="{safe}-door-list.csv"')
+    h.send_header("Content-Length", str(len(data)))
+    h.end_headers()
+    h.wfile.write(data)
+
+
 @route("GET", r"/admin/events/(?P<eid>[\w]+)/door")
 def admin_door(h, eid):
     """Door list: every booking party, who's arrived and who's still to come.
@@ -664,7 +849,8 @@ def admin_dashboard(h):
                                   mail_from=mailer.from_address(),
                                   mail_reply=mailer.reply_to(),
                                   wallet_on=wallet.is_configured(),
-                                  wallet_problem=wallet.config_problem()))
+                                  wallet_problem=wallet.config_problem(),
+                                  pay_mode=payments.mode_label()))
 
 
 @route("GET", "/admin/events/new")
@@ -842,7 +1028,11 @@ def main():
               "but nothing will be emailed.")
     port = int(os.environ.get("PORT", "8000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    mode = "Stripe test mode" if payments.is_live() else "MOCK payment mode"
+    mode = {
+        "live": "*** LIVE — REAL CARDS WILL BE CHARGED ***",
+        "test": "Stripe TEST mode (no real money)",
+        "mock": "MOCK payment mode (Stripe not connected)",
+    }[payments.mode_label()]
     print("\n  Mayhem Bingo tickets running")
     print(f"  → http://localhost:{port}   ({mode})")
     print(f"  → Organiser dashboard: http://localhost:{port}/admin  (password: {ADMIN_PASSWORD})")

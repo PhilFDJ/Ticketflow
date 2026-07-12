@@ -76,6 +76,43 @@ def _migrate(conn):
         # success page be refreshed without spamming them with duplicate emails.
         conn.execute("ALTER TABLE orders ADD COLUMN emailed_at INTEGER")
 
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS discounts (
+      id           TEXT PRIMARY KEY,
+      code         TEXT NOT NULL UNIQUE,   -- stored UPPERCASE, matched case-insensitively
+      kind         TEXT NOT NULL,          -- 'percent' | 'fixed'
+      value        INTEGER NOT NULL,       -- percent: 1-100. fixed: pence off.
+      event_id     TEXT,                   -- NULL = valid on every event
+      max_uses     INTEGER,                -- NULL = unlimited
+      used_count   INTEGER NOT NULL DEFAULT 0,
+      expires_at   INTEGER,                -- NULL = never expires
+      active       INTEGER NOT NULL DEFAULT 1,
+      created_at   INTEGER NOT NULL
+    )""")
+
+    # Which order used which code. Also how we count redemptions reliably —
+    # used_count alone could drift if an order is created but never paid.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS discount_uses (
+      id           TEXT PRIMARY KEY,
+      discount_id  TEXT NOT NULL,
+      order_id     TEXT NOT NULL,
+      amount_off   INTEGER NOT NULL,       -- pence actually taken off
+      created_at   INTEGER NOT NULL
+    )""")
+
+    ocols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+    if "buyer_phone" not in ocols:
+        # Phone number, so you can chase a no-show or an abandoned cart.
+        conn.execute("ALTER TABLE orders ADD COLUMN buyer_phone TEXT NOT NULL DEFAULT ''")
+    if "discount_id" not in ocols:
+        # What was applied, and how much came off. `total` stays the amount the
+        # customer ACTUALLY paid, so revenue figures never need adjusting.
+        conn.execute("ALTER TABLE orders ADD COLUMN discount_id TEXT")
+        conn.execute("ALTER TABLE orders ADD COLUMN discount_code TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE orders ADD COLUMN discount_amount INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE orders ADD COLUMN subtotal INTEGER NOT NULL DEFAULT 0")
+
     ecols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
     if "image" not in ecols:
         # A real cover image (uploaded file path or external URL). The original
@@ -219,14 +256,15 @@ def delete_ticket_type(tid):
 # Orders & tickets
 # ---------------------------------------------------------------------------
 def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
-                 currency="GBP"):
+                 currency="GBP", buyer_phone="", discount_code=""):
     """items: list of (ticket_type_id, qty). Validates stock. Returns order id.
 
-    Raises ValueError if a ticket type is sold out / lacks stock.
+    Raises ValueError if a ticket type is sold out / lacks stock, or if a supplied
+    discount code is invalid.
     """
     oid = new_id("ord")
     with cursor() as conn:
-        total = 0
+        subtotal = 0
         resolved = []
         for tt_id, qty in items:
             if qty <= 0:
@@ -238,15 +276,29 @@ def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
             remaining = tt["quantity"] - tt["sold"]
             if qty > remaining:
                 raise ValueError(f"Only {remaining} left for {tt['name']}")
-            total += tt["price"] * qty
+            subtotal += tt["price"] * qty
             resolved.append((tt_id, qty, tt["price"]))
         if not resolved:
             raise ValueError("No tickets selected")
+
+    # Validate the code against the real subtotal. Outside the transaction above
+    # because validate_discount opens its own cursor.
+    disc, off = (None, 0)
+    if discount_code:
+        disc, off = validate_discount(discount_code, event_id, subtotal)
+
+    total = subtotal - off      # what the customer ACTUALLY pays
+
+    with cursor() as conn:
         conn.execute(
-            "INSERT INTO orders (id,event_id,buyer_name,buyer_email,total,"
-            "currency,status,provider,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (oid, event_id, buyer_name, buyer_email, total, currency,
-             "pending", provider, now()),
+            "INSERT INTO orders (id,event_id,buyer_name,buyer_email,buyer_phone,"
+            "total,subtotal,discount_id,discount_code,discount_amount,"
+            "currency,status,provider,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (oid, event_id, buyer_name, buyer_email, buyer_phone or "", total,
+             subtotal, disc["id"] if disc else None,
+             disc["code"] if disc else "", off,
+             currency, "pending", provider, now()),
         )
         for tt_id, qty, price in resolved:
             conn.execute(
@@ -292,6 +344,13 @@ def mark_order_paid(oid):
         if order["status"] == "paid" and existing:
             return [dict(r) for r in existing]
 
+    # Count the discount only now the money has actually arrived. Counting it at
+    # checkout would let abandoned carts burn through a limited code's uses.
+    did = order["discount_id"] if "discount_id" in order.keys() else None
+    if did:
+        redeem_discount(did, oid, order["discount_amount"])
+
+    with cursor() as conn:
         conn.execute("UPDATE orders SET status = 'paid' WHERE id = ?", (oid,))
         items = conn.execute("SELECT * FROM order_items WHERE order_id = ?",
                              (oid,)).fetchall()
@@ -402,6 +461,177 @@ def known_venues():
             "ORDER BY last_used DESC"
         ).fetchall()
     return [{"venue": r["venue"], "address": r["address"] or ""} for r in rows]
+
+
+def all_orders(status=None, search="", limit=500):
+    """Every order across every event — so you don't have to dig into each one.
+
+    status: 'paid' | 'pending' (an abandoned cart) | None for all.
+
+    An abandoned cart isn't a separate thing: it's an order that was created at
+    checkout but never paid for. We already record those, we just never showed them.
+    """
+    sql = (
+        "SELECT o.id, o.buyer_name, o.buyer_email, o.buyer_phone, o.total, "
+        "o.currency, o.status, o.created_at, o.provider, "
+        "e.id AS event_id, e.title AS event_title, e.starts_at, "
+        "(SELECT COUNT(*) FROM tickets t WHERE t.order_id = o.id) AS ticket_count, "
+        "(SELECT SUM(oi.qty) FROM order_items oi WHERE oi.order_id = o.id) AS item_qty "
+        "FROM orders o JOIN events e ON e.id = o.event_id"
+    )
+    params, where = [], []
+    if status:
+        where.append("o.status = ?")
+        params.append(status)
+    if search:
+        where.append("(LOWER(o.buyer_name) LIKE ? OR LOWER(o.buyer_email) LIKE ? "
+                     "OR o.buyer_phone LIKE ? OR LOWER(e.title) LIKE ?)")
+        q = f"%{search.lower()}%"
+        params += [q, q, q, q]
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY o.created_at DESC LIMIT ?"
+    params.append(limit)
+
+    with cursor() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def orders_summary():
+    """Headline numbers for the all-orders page."""
+    with cursor() as conn:
+        paid = conn.execute(
+            "SELECT COUNT(*) c, COALESCE(SUM(total),0) v FROM orders WHERE status='paid'"
+        ).fetchone()
+        pending = conn.execute(
+            "SELECT COUNT(*) c, COALESCE(SUM(total),0) v FROM orders WHERE status='pending'"
+        ).fetchone()
+    return {
+        "paid_count": paid["c"], "revenue": paid["v"],
+        "abandoned_count": pending["c"], "abandoned_value": pending["v"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Discount codes
+# ---------------------------------------------------------------------------
+def create_discount(code, kind, value, event_id=None, max_uses=None,
+                    expires_at=None):
+    """kind: 'percent' (value 1-100) or 'fixed' (value in pence)."""
+    code = (code or "").strip().upper()
+    if not code:
+        raise ValueError("Enter a code.")
+    if kind not in ("percent", "fixed"):
+        raise ValueError("Unknown discount type.")
+    value = int(value)
+    if kind == "percent" and not (1 <= value <= 100):
+        raise ValueError("A percentage must be between 1 and 100.")
+    if kind == "fixed" and value < 1:
+        raise ValueError("The amount off must be more than zero.")
+    if max_uses is not None and int(max_uses) < 1:
+        raise ValueError("Usage limit must be at least 1 (or leave it blank).")
+
+    did = new_id("dsc")
+    with cursor() as conn:
+        exists = conn.execute("SELECT 1 FROM discounts WHERE code = ?", (code,)).fetchone()
+        if exists:
+            raise ValueError(f"The code {code} already exists.")
+        conn.execute(
+            "INSERT INTO discounts (id,code,kind,value,event_id,max_uses,"
+            "used_count,expires_at,active,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (did, code, kind, value, event_id or None,
+             int(max_uses) if max_uses else None, 0,
+             int(expires_at) if expires_at else None, 1, now()))
+    return did
+
+
+def list_discounts():
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT d.*, e.title AS event_title FROM discounts d "
+            "LEFT JOIN events e ON e.id = d.event_id "
+            "ORDER BY d.created_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_discount_by_code(code):
+    with cursor() as conn:
+        row = conn.execute("SELECT * FROM discounts WHERE code = ?",
+                           ((code or "").strip().upper(),)).fetchone()
+    return dict(row) if row else None
+
+
+def set_discount_active(did, active):
+    with cursor() as conn:
+        conn.execute("UPDATE discounts SET active = ? WHERE id = ?",
+                     (1 if active else 0, did))
+
+
+def delete_discount(did):
+    with cursor() as conn:
+        conn.execute("DELETE FROM discounts WHERE id = ?", (did,))
+
+
+def validate_discount(code, event_id, subtotal):
+    """Check a code and work out what it's worth.
+
+    Returns (discount_dict, amount_off_pence) or raises ValueError with a message
+    the customer sees. Every rejection path is explicit — a discount that silently
+    fails, or silently applies when it shouldn't, is a money bug.
+    """
+    d = get_discount_by_code(code)
+    if not d:
+        raise ValueError("That code isn't recognised.")
+    if not d["active"]:
+        raise ValueError("That code is no longer active.")
+    if d["expires_at"] and now() > d["expires_at"]:
+        raise ValueError("That code has expired.")
+    if d["event_id"] and d["event_id"] != event_id:
+        raise ValueError("That code isn't valid for this event.")
+    if d["max_uses"] is not None and d["used_count"] >= d["max_uses"]:
+        raise ValueError("That code has been fully used.")
+
+    if d["kind"] == "percent":
+        off = (subtotal * d["value"]) // 100
+    else:
+        off = d["value"]
+
+    # Never discount below zero, and never let a fixed discount exceed the total.
+    off = max(0, min(off, subtotal))
+    if off <= 0:
+        raise ValueError("That code doesn't reduce this order.")
+    return d, off
+
+
+def redeem_discount(did, order_id, amount_off):
+    """Record a redemption. Called only when an order is actually PAID.
+
+    Counting at payment (not at checkout) is deliberate: otherwise abandoned carts
+    would burn through a limited code's uses without anyone paying.
+
+    Returns False if the code ran out in the meantime — two people can be at the
+    checkout with the last use of a code at the same time.
+    """
+    with cursor() as conn:
+        # Re-check the limit inside the transaction, then increment atomically.
+        row = conn.execute(
+            "SELECT max_uses, used_count FROM discounts WHERE id = ?", (did,)).fetchone()
+        if row is None:
+            return False
+        if row["max_uses"] is not None and row["used_count"] >= row["max_uses"]:
+            return False
+        already = conn.execute(
+            "SELECT 1 FROM discount_uses WHERE order_id = ?", (order_id,)).fetchone()
+        if already:
+            return True          # idempotent: don't double-count a re-confirmed order
+        conn.execute("UPDATE discounts SET used_count = used_count + 1 WHERE id = ?",
+                     (did,))
+        conn.execute(
+            "INSERT INTO discount_uses (id,discount_id,order_id,amount_off,created_at)"
+            " VALUES (?,?,?,?,?)",
+            (new_id("du"), did, order_id, amount_off, now()))
+    return True
 
 
 def tickets_for_order(oid):

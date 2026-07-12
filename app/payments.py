@@ -19,7 +19,32 @@ def stripe_key():
 
 
 def is_live():
+    """True if ANY Stripe key is set (i.e. we're not in mock mode).
+
+    NOTE: this does not mean real money — see is_real_money(). The name is
+    historical; it distinguishes 'Stripe is wired up' from 'mock checkout'.
+    """
     return bool(stripe_key())
+
+
+def is_real_money():
+    """True only for a LIVE Stripe key — i.e. real cards, real money.
+
+    Stripe keys are prefixed: sk_test_... is a sandbox, sk_live_... is real. The
+    dashboard used to say "test mode" for both, which is exactly the sort of thing
+    that gets someone taking real payments while believing they're testing.
+    """
+    return stripe_key().startswith("sk_live_")
+
+
+def mode_label():
+    """How to describe the current payment mode, in plain words."""
+    key = stripe_key()
+    if not key:
+        return "mock"          # no Stripe at all — simulated checkout
+    if key.startswith("sk_live_"):
+        return "live"          # REAL MONEY
+    return "test"              # Stripe sandbox
 
 
 def _form_encode(data, parent=None):
@@ -86,6 +111,23 @@ def create_checkout(order, items, event, base_url):
         "metadata": {"order_id": order["id"]},
         "line_items": line_items,
     }
+
+    # CRITICAL: line_items are at full price, so without this Stripe would charge
+    # the customer the FULL amount while our page showed them a discounted total.
+    # Stripe applies discounts via a coupon on the session, so mint a one-off
+    # coupon for exactly the amount we took off.
+    discount_amount = order["discount_amount"] if "discount_amount" in order.keys() else 0
+    if discount_amount and discount_amount > 0:
+        coupon = _stripe_post("/coupons", {
+            "amount_off": discount_amount,
+            "currency": event["currency"].lower(),
+            "duration": "once",
+            "name": (order["discount_code"] or "Discount")[:40],
+            # Stripe keeps coupons around; this one is for a single checkout.
+            "max_redemptions": 1,
+        })
+        payload["discounts"] = [{"coupon": coupon["id"]}]
+
     session = _stripe_post("/checkout/sessions", payload)
     return session["url"], "stripe", session["id"]
 

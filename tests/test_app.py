@@ -95,7 +95,8 @@ def run():
 
         # 2. Checkout -> mock pay -> confirm -> success with tickets
         form = {"event_id": eid, "buyer_name": "Test Buyer",
-                "buyer_email": "buyer@test.com", f"qty_{tt_ids[0]}": "2"}
+                "buyer_email": "buyer@test.com", "buyer_phone": "07700900123",
+                f"qty_{tt_ids[0]}": "2"}
         code, _, hdrs = post(op, "/checkout", form)
         loc = hdrs.get("Location", "")
         ok &= check("checkout redirects to mock pay", code == 303 and "/mock/pay?order=" in loc)
@@ -164,7 +165,8 @@ def run():
         qid = re.search(r'name="qty_(tt_\w+)"', evpage).group(1)
         code, resp, _ = post(op, "/checkout", {
             "event_id": newloc.split("/")[-1], "buyer_name": "Greedy",
-            "buyer_email": "g@t.com", f"qty_{qid}": "99"})
+            "buyer_email": "g@t.com", "buyer_phone": "07700900123",
+            f"qty_{qid}": "99"})
         ok &= check("oversell blocked", "Only 5 left" in resp or "left for" in resp)
 
     finally:
