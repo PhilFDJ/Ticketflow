@@ -392,8 +392,53 @@ def scanner():
           if(j.status==='already' && j.ticket.scanned_at)
             detail += `<div class="muted small">First scanned earlier</div>`;
         }
-        out.innerHTML = `<div class="scan-result ${cls}"><div class="big">${head}</div>${detail}</div>`;
+
+        // Group booking: this ticket is one of several on the same order. Offer to
+        // wave the whole party through rather than scanning each phone in turn.
+        let group = '';
+        if(j.order && j.order.remaining > 0){
+          group = `
+            <div class="groupbox">
+              <div class="groupline"><b>${j.order.buyer_name||'This booking'}</b> has
+                ${j.order.total} tickets — ${j.order.admitted} in,
+                <b>${j.order.remaining} still to come</b>.</div>
+              <div class="row mt2">
+                <button class="btn" onclick="admitAll('${j.order.id}')">
+                  Admit all ${j.order.remaining}</button>
+                <button class="btn ghost" onclick="dismissGroup()">Just this one</button>
+              </div>
+            </div>`;
+        }
+
+        out.innerHTML = `<div class="scan-result ${cls}"><div class="big">${head}</div>${detail}</div>${group}`;
         if(navigator.vibrate) navigator.vibrate(j.status==='ok'?80:[60,40,60]);
+      }catch(e){
+        out.innerHTML = `<div class="scan-result invalid"><div class="big">Network error</div></div>`;
+      }
+    }
+
+    function dismissGroup(){
+      const g = document.querySelector('.groupbox');
+      if(g) g.remove();
+    }
+
+    async function admitAll(orderId){
+      const out = document.getElementById('out');
+      try{
+        const r = await fetch('/api/admit-order', {method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({order_id: orderId})});
+        const j = await r.json();
+        if(j.status !== 'ok'){
+          out.innerHTML = `<div class="scan-result invalid"><div class="big">Couldn't admit group</div></div>`;
+          return;
+        }
+        out.innerHTML = `<div class="scan-result ok">
+            <div class="big">✓ Party admitted</div>
+            <div>${j.buyer_name||''}</div>
+            <div class="muted small">${j.admitted} admitted just now · ${j.total} in the party</div>
+          </div>`;
+        if(navigator.vibrate) navigator.vibrate([80,40,80]);
       }catch(e){
         out.innerHTML = `<div class="scan-result invalid"><div class="big">Network error</div></div>`;
       }
@@ -479,6 +524,102 @@ def scanner():
 # ---------------------------------------------------------------------------
 # Organiser dashboard
 # ---------------------------------------------------------------------------
+def admin_door(event, parties):
+    total_tickets = sum(p["total"] for p in parties)
+    total_in = sum(p["in_count"] for p in parties)
+    to_come = total_tickets - total_in
+
+    rows = []
+    for p in parties:
+        state = p["state"]
+        badge = {
+            "in": '<span class="pill ok">All in</span>',
+            "partial": f'<span class="pill warn">{p["in_count"]}/{p["total"]} in</span>',
+            "waiting": '<span class="pill">To come</span>',
+        }[state]
+        kinds = {}
+        for t in p["tickets"]:
+            kinds[t["ticket_name"]] = kinds.get(t["ticket_name"], 0) + 1
+        kind_str = ", ".join(f"{n}× {esc(k)}" for k, n in kinds.items())
+
+        act = ""
+        if state != "in":
+            remaining = p["total"] - p["in_count"]
+            act = (f'<button class="btn sm act" '
+                   f'onclick="doorAdmit(\'{esc(p["order_id"])}\', this)">'
+                   f'Admit {remaining}</button>')
+
+        rows.append(f"""
+        <div class="party {state}" data-state="{state}" data-name="{esc((p['buyer_name'] or '').lower())}">
+          <div>
+            <div class="who">{esc(p['buyer_name'] or 'Unknown')} {badge}</div>
+            <div class="meta">{kind_str}</div>
+          </div>
+          {act}
+        </div>""")
+
+    body = f"""
+    <a href="/admin/events/{esc(event['id'])}" class="muted small">← {esc(event['title'])}</a>
+    <h1 class="mt2">On the door</h1>
+    <p class="lead">{esc(event['title'])} · {esc(fmt_date(event['starts_at']))}</p>
+
+    <div class="grid cols-3 mt2">
+      <div class="stat"><div class="n">{total_in}</div><div class="l">Checked in</div></div>
+      <div class="stat"><div class="n">{to_come}</div><div class="l">Still to come</div></div>
+      <div class="stat"><div class="n">{total_tickets}</div><div class="l">Tickets sold</div></div>
+    </div>
+
+    <div class="att-tabs mt3">
+      <button class="on" data-f="all"     onclick="doorFilter(this,'all')">Everyone</button>
+      <button          data-f="waiting" onclick="doorFilter(this,'waiting')">Still to come</button>
+      <button          data-f="in"      onclick="doorFilter(this,'in')">Arrived</button>
+    </div>
+    <input id="doorSearch" placeholder="Search a name…" oninput="doorSearchFn()" class="mt1">
+
+    <div id="doorList" class="mt2">
+      {''.join(rows) or '<p class="muted">No tickets sold yet.</p>'}
+    </div>
+
+    <p class="muted small mt3">Tip: keep the <a href="/scan">scanner</a> open on another tab
+      — this list updates when you reload.</p>
+
+    <script>
+    let doorF = 'all';
+    function doorFilter(btn, f){{
+      doorF = f;
+      document.querySelectorAll('.att-tabs button').forEach(b => b.classList.remove('on'));
+      btn.classList.add('on');
+      doorApply();
+    }}
+    function doorSearchFn(){{ doorApply(); }}
+    function doorApply(){{
+      const q = (document.getElementById('doorSearch').value || '').toLowerCase().trim();
+      document.querySelectorAll('.party').forEach(el => {{
+        const st = el.dataset.state;
+        // "Still to come" includes partly-arrived parties — they've people outstanding.
+        let okF = doorF === 'all'
+          || (doorF === 'waiting' && (st === 'waiting' || st === 'partial'))
+          || (doorF === 'in' && (st === 'in' || st === 'partial'));
+        const okQ = !q || (el.dataset.name || '').includes(q);
+        el.style.display = (okF && okQ) ? '' : 'none';
+      }});
+    }}
+    async function doorAdmit(orderId, btn){{
+      btn.disabled = true; btn.textContent = 'Admitting…';
+      try{{
+        const r = await fetch('/api/admit-order', {{method:'POST',
+          headers:{{'Content-Type':'application/json'}},
+          body: JSON.stringify({{order_id: orderId}})}});
+        const j = await r.json();
+        if(j.status === 'ok') location.reload();
+        else {{ btn.disabled = false; btn.textContent = 'Failed — retry'; }}
+      }}catch(e){{ btn.disabled = false; btn.textContent = 'Failed — retry'; }}
+    }}
+    </script>
+    """
+    return layout("On the door", body, admin=True)
+
+
 def admin_login(error=None):
     err = flash("err", error) if error else ""
     return layout("Organiser sign in", f"""
@@ -638,6 +779,7 @@ def admin_event(event, ticket_types, stats, orders, live_mode):
       <h1 class="mt0">{esc(event['title'])}</h1>
       <div>
         <a class="btn ghost sm" href="/events/{esc(event['id'])}">View public page</a>
+        <a class="btn sm" href="/admin/events/{esc(event['id'])}/door">🚪 On the door</a>
         <form method="post" action="/admin/events/toggle" style="display:inline">
           <input type="hidden" name="id" value="{esc(event['id'])}">
           <button class="btn sm" type="submit">{pub}</button>

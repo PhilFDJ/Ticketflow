@@ -458,7 +458,55 @@ def api_scan(h):
             "buyer_name": ticket.get("buyer_name"),
             "scanned_at": ticket.get("scanned_at"),
         }
+        # Group context: a party of 4 arriving together shouldn't need 4 separate
+        # scans, so tell the door how many tickets are on this booking.
+        oid = ticket.get("order_id")
+        if oid:
+            party = db.order_ticket_state(oid)
+            if len(party) > 1:
+                remaining = sum(1 for t in party if t["status"] != "used")
+                resp["order"] = {
+                    "id": oid,
+                    "buyer_name": ticket.get("buyer_name"),
+                    "total": len(party),
+                    "admitted": len(party) - remaining,
+                    "remaining": remaining,
+                }
     h.send_json(resp)
+
+
+@route("GET", r"/admin/events/(?P<eid>[\w]+)/door")
+def admin_door(h, eid):
+    """Door list: every booking party, who's arrived and who's still to come.
+    This is the page you keep open on the night."""
+    if not require_admin(h):
+        return
+    event = db.get_event(eid)
+    if not event:
+        return h.send_html(T.layout("Error", "<h1>Unknown event</h1>"), 404)
+    parties = db.event_attendance(eid)
+    h.send_html(T.admin_door(event, parties))
+
+
+@route("POST", "/api/admit-order")
+def api_admit_order(h):
+    """Admit every remaining ticket on one booking — the whole party at once."""
+    try:
+        payload = json.loads(h.read_body().decode() or "{}")
+    except json.JSONDecodeError:
+        return h.send_json({"status": "invalid"}, 400)
+    oid = (payload.get("order_id") or "").strip()
+    if not oid or not db.get_order(oid):
+        return h.send_json({"status": "invalid"}, 404)
+    admitted, already = db.admit_order(oid)
+    party = db.order_ticket_state(oid)
+    h.send_json({
+        "status": "ok",
+        "admitted": admitted,
+        "already": already,
+        "total": len(party),
+        "buyer_name": party[0]["buyer_name"] if party else "",
+    })
 
 
 # =====================================================================

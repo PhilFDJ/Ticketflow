@@ -310,6 +310,78 @@ def mark_order_paid(oid):
         return [dict(r) for r in created]
 
 
+def order_ticket_state(order_id):
+    """Every ticket on an order, with who bought it — so the door can see
+    'this is a group of 4, 1 already in, 3 to come'."""
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT t.code, t.status, t.scanned_at, tt.name AS ticket_name, "
+            "o.buyer_name, o.buyer_email "
+            "FROM tickets t "
+            "JOIN ticket_types tt ON tt.id = t.ticket_type_id "
+            "JOIN orders o ON o.id = t.order_id "
+            "WHERE t.order_id = ? ORDER BY t.created_at", (order_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def admit_order(order_id):
+    """Admit every still-valid ticket on an order in one go (group arriving
+    together). Returns (admitted_count, already_count)."""
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT id, status FROM tickets WHERE order_id = ?", (order_id,)).fetchall()
+        admitted = 0
+        already = 0
+        for r in rows:
+            if r["status"] == "used":
+                already += 1
+            else:
+                conn.execute(
+                    "UPDATE tickets SET status = 'used', scanned_at = ? WHERE id = ?",
+                    (now(), r["id"]))
+                admitted += 1
+    return admitted, already
+
+
+def event_attendance(event_id):
+    """Who's in and who's still to come, grouped by order (a booking party)."""
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT o.id AS order_id, o.buyer_name, o.buyer_email, o.created_at, "
+            "t.code, t.status, t.scanned_at, tt.name AS ticket_name "
+            "FROM tickets t "
+            "JOIN orders o ON o.id = t.order_id "
+            "JOIN ticket_types tt ON tt.id = t.ticket_type_id "
+            "WHERE t.event_id = ? AND o.status = 'paid' "
+            "ORDER BY o.buyer_name COLLATE NOCASE, t.created_at", (event_id,)).fetchall()
+
+    parties = {}
+    for r in rows:
+        p = parties.setdefault(r["order_id"], {
+            "order_id": r["order_id"],
+            "buyer_name": r["buyer_name"],
+            "buyer_email": r["buyer_email"],
+            "tickets": [],
+        })
+        p["tickets"].append({
+            "code": r["code"], "status": r["status"],
+            "scanned_at": r["scanned_at"], "ticket_name": r["ticket_name"],
+        })
+
+    out = []
+    for p in parties.values():
+        used = sum(1 for t in p["tickets"] if t["status"] == "used")
+        total = len(p["tickets"])
+        p["in_count"] = used
+        p["total"] = total
+        p["state"] = "in" if used == total else ("partial" if used else "waiting")
+        out.append(p)
+    # Still-to-come first — that's what you're looking for on the night.
+    order = {"waiting": 0, "partial": 1, "in": 2}
+    out.sort(key=lambda p: (order[p["state"]], (p["buyer_name"] or "").lower()))
+    return out
+
+
 def tickets_for_order(oid):
     with cursor() as conn:
         rows = conn.execute(
