@@ -475,6 +475,34 @@ def api_scan(h):
     h.send_json(resp)
 
 
+@route("POST", "/admin/test-email")
+def admin_test_email(h):
+    """Send a test email and report exactly what happened. Email failures are
+    otherwise silent by design (they must never break a sale), which makes them
+    very hard to diagnose — this makes the failure visible."""
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    to = (flat.get("to") or "").strip()
+    if not to:
+        return h.send_json({"ok": False, "error": "Enter an email address."})
+    if not mailer.is_configured():
+        return h.send_json({"ok": False, "error":
+            "No mail provider configured. Set RESEND_API_KEY (or SMTP_HOST) in "
+            "your Render environment, then redeploy."})
+    ok, err = mailer.send_verbose(
+        to, "Mayhem Bingo — test email",
+        "<p>This is a test from your ticket site. If you're reading this, "
+        "ticket emails are working.</p>",
+        "Test from your ticket site. Ticket emails are working.")
+    return h.send_json({
+        "ok": ok,
+        "error": err,
+        "from": mailer.from_address(),
+        "reply_to": mailer.reply_to(),
+    })
+
+
 @route("GET", r"/admin/events/(?P<eid>[\w]+)/door")
 def admin_door(h, eid):
     """Door list: every booking party, who's arrived and who's still to come.
@@ -549,7 +577,10 @@ def admin_dashboard(h):
         return
     events = db.list_events()
     stats = {e["id"]: db.event_stats(e["id"]) for e in events}
-    h.send_html(T.admin_dashboard(events, stats, payments.is_live()))
+    h.send_html(T.admin_dashboard(events, stats, payments.is_live(),
+                                  mail_on=mailer.is_configured(),
+                                  mail_from=mailer.from_address(),
+                                  mail_reply=mailer.reply_to()))
 
 
 @route("GET", "/admin/events/new")
@@ -698,6 +729,17 @@ def main():
             seed.run()
         except Exception as e:
             sys.stderr.write(f"(seed skipped: {e})\n")
+
+    # Say plainly whether tickets will be emailed. This used to fail silently —
+    # no key meant no email and no warning, which is impossible to diagnose from
+    # the outside.
+    if mailer.is_configured():
+        print(f"  Ticket emails: ON  (from {mailer.from_address()}, "
+              f"replies to {mailer.reply_to()})")
+    else:
+        print("  Ticket emails: OFF — no RESEND_API_KEY (or SMTP_HOST) set.")
+        print("                 Buyers will see and can print their tickets, "
+              "but nothing will be emailed.")
     port = int(os.environ.get("PORT", "8000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     mode = "Stripe test mode" if payments.is_live() else "MOCK payment mode"

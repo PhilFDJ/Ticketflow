@@ -197,3 +197,14 @@ footer.site{border-top:1px solid var(--line);color:var(--muted);font-size:13px;p
 .party.in{border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.07)}
 .party.partial{border-color:rgba(245,158,11,.4);background:rgba(245,158,11,.07)}
 .party .act{flex:0 0 auto}
+
+/* Aiming guide — the decoder reads the centre of the frame, so show where to hold
+   the ticket. Without this people hold the QR at the edge and wonder why nothing
+   happens. */
+#reader{position:relative}
+#reader::after{
+  content:""; position:absolute; inset:10%;
+  border:3px solid rgba(255,255,255,.85); border-radius:16px;
+  box-shadow:0 0 0 100vmax rgba(0,0,0,.25);
+  pointer-events:none;
+}

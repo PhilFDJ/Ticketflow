@@ -356,6 +356,7 @@ def scanner():
       <h1>Door scanner</h1>
       <p class="lead">Point the camera at a ticket QR to check people in.</p>
       <div id="reader"></div>
+      <div id="dbg" class="muted small center mt1"></div>
       <div id="out"></div>
       <div class="center mt2">
         <button class="btn ghost" id="startbtn" onclick="startScan()">Start camera</button>
@@ -482,14 +483,30 @@ def scanner():
           'On iPhone: aA menu → Website Settings → Camera → Allow.</div></div>';
         return;
       }
-      video.srcObject = stream; await video.play();
+      video.srcObject = stream;
+      try { await video.play(); } catch(e) {}
       running = true;
-      document.getElementById('startbtn').textContent =
-        useFallback ? 'Scanning…' : 'Scanning…';
+      document.getElementById('startbtn').textContent = 'Scanning…';
 
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d', {willReadFrequently:true});
-      let busy = false, lastHit = 0;
+      let lastHit = 0, frames = 0, decodes = 0, started = Date.now();
+
+      const dbg = document.getElementById('dbg');
+      function setDbg(msg){ if(dbg) dbg.textContent = msg; }
+      setDbg(det ? 'Using built-in scanner…' : 'Using fallback scanner…');
+
+      // iOS Safari reports videoWidth = 0 for a while after play() resolves, and
+      // sometimes needs a nudge. Wait for real frames before we start decoding.
+      let waited = 0;
+      while (running && !video.videoWidth && waited < 5000) {
+        await new Promise(r => setTimeout(r, 100));
+        waited += 100;
+      }
+      if (running && !video.videoWidth) {
+        setDbg('Camera gave no picture. Try reloading, or use the manual box.');
+        return;
+      }
 
       const loop = async () => {
         if(!running) return;
@@ -498,22 +515,40 @@ def scanner():
           if(det){
             const codes = await det.detect(video);
             if(codes.length && now - lastHit > 1500){ lastHit = now; check(codes[0].rawValue); }
-          }else if(!busy && video.videoWidth){
-            busy = true;
-            // Downscale for speed — a QR is still readable at ~480px, and this
-            // keeps the decode fast enough to feel live on an older phone.
-            const scale = Math.min(1, 480 / video.videoWidth);
-            canvas.width  = Math.round(video.videoWidth  * scale);
-            canvas.height = Math.round(video.videoHeight * scale);
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          }else if(video.videoWidth){
+            frames++;
+            // Decode only a centre crop. It's where people hold the ticket, and
+            // it's far less work than the whole frame — the full-frame decode was
+            // slow enough on a phone to feel like nothing was happening.
+            const vw = video.videoWidth, vh = video.videoHeight;
+            const side = Math.min(vw, vh);
+            const crop = Math.round(side * 0.8);
+            const sx = Math.round((vw - crop) / 2), sy = Math.round((vh - crop) / 2);
+
+            const target = 400;                 // decode resolution
+            canvas.width = target; canvas.height = target;
+            ctx.drawImage(video, sx, sy, crop, crop, 0, 0, target, target);
+            const img = ctx.getImageData(0, 0, target, target);
+
             let text = null;
-            try{ text = QRScan.decode(img); }catch(e){ text = null; }
-            if(text && now - lastHit > 1500){ lastHit = now; check(text); }
-            busy = false;
+            try{ text = QRScan.decode(img); decodes++; }catch(e){ text = null; }
+
+            if(text && now - lastHit > 1500){
+              lastHit = now;
+              setDbg('Got it!');
+              check(text);
+            } else if(frames % 10 === 0){
+              const secs = ((now - started)/1000).toFixed(0);
+              setDbg('Scanning… (' + frames + ' frames in ' + secs + 's) — '
+                     + 'hold the QR steady in the middle, filling about half the box');
+            }
           }
-        }catch(e){ busy = false; }
-        requestAnimationFrame(loop);
+        }catch(e){
+          setDbg('Scan error: ' + (e && e.message ? e.message : e));
+        }
+        // setTimeout, not requestAnimationFrame: iOS throttles rAF aggressively
+        // and the decode is heavy enough to starve it.
+        if(running) setTimeout(loop, 120);
       };
       loop();
     }
@@ -639,7 +674,7 @@ def admin_login(error=None):
     </div>""")
 
 
-def admin_dashboard(events, stats_by_event, live_mode):
+def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from="", mail_reply=""):
     rows = []
     tot_rev = 0
     for e in events:
@@ -659,6 +694,17 @@ def admin_dashboard(events, stats_by_event, live_mode):
              if rows else '<p class="muted">No events yet — create your first below.</p>')
     mode = ('<span class="pill ok">Stripe test mode</span>' if live_mode
             else '<span class="pill warn">Mock payments</span>')
+    mail_badge = ('<span class="pill ok">On</span>' if mail_on
+                  else '<span class="pill bad">Off</span>')
+    if mail_on:
+        mail_note = (f'<p class="muted small">Buyers are emailed their tickets. '
+                     f'Sent from <b>{esc(mail_from)}</b>, replies go to '
+                     f'<b>{esc(mail_reply)}</b>. Send yourself a test:</p>')
+    else:
+        mail_note = ('<div class="flash err"><b>Tickets are NOT being emailed.</b><br>'
+                     'No mail provider is configured. Set <code>RESEND_API_KEY</code> in '
+                     'your Render environment (Environment tab), then redeploy. '
+                     'Buyers can still see and print their tickets.</div>')
     return layout("Dashboard", f"""
     <div style="display:flex;justify-content:space-between;align-items:center">
       <h1 class="mt0">Dashboard</h1>
@@ -670,6 +716,40 @@ def admin_dashboard(events, stats_by_event, live_mode):
       <div class="stat"><div class="n">{mode}</div><div class="l">Payments</div></div>
     </div>
     <div class="card mt3"><div class="body">{table}</div></div>
+
+    <div class="card mt3"><div class="body">
+      <h2 class="mt0">Ticket emails {mail_badge}</h2>
+      {mail_note}
+      <div class="row mt2">
+        <input id="testTo" type="email" placeholder="your@email.com">
+        <button class="btn" style="flex:0 0 auto" onclick="testEmail()">Send test</button>
+      </div>
+      <div id="testOut" class="mt2"></div>
+    </div></div>
+
+    <script>
+    async function testEmail(){{
+      const to = document.getElementById('testTo').value.trim();
+      const out = document.getElementById('testOut');
+      if(!to){{ out.innerHTML = '<div class="flash err">Enter an email address.</div>'; return; }}
+      out.innerHTML = '<div class="flash info">Sending…</div>';
+      try{{
+        const r = await fetch('/admin/test-email', {{method:'POST',
+          headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+          body: 'to=' + encodeURIComponent(to)}});
+        const j = await r.json();
+        if(j.ok){{
+          out.innerHTML = '<div class="flash ok">Sent. Check ' + to +
+            ' (and the spam folder). From: ' + j.from + '</div>';
+        }}else{{
+          out.innerHTML = '<div class="flash err"><b>Failed.</b><br>' +
+            (j.error || 'Unknown error') + '</div>';
+        }}
+      }}catch(e){{
+        out.innerHTML = '<div class="flash err">Request failed: ' + e.message + '</div>';
+      }}
+    }}
+    </script>
     """, admin=True)
 
 

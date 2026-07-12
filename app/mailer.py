@@ -53,16 +53,41 @@ def send(to_email: str, subject: str, html: str, text: str = "") -> bool:
 
     Never raises — a failed email must not break a completed purchase.
     """
+    ok, _ = send_verbose(to_email, subject, html, text)
+    return ok
+
+
+def send_verbose(to_email: str, subject: str, html: str, text: str = ""):
+    """Same as send(), but also returns the error message.
+
+    Used by the admin test-email tool: normally failures are swallowed so a sale
+    can't break, but that makes misconfiguration invisible. This surfaces it.
+    Returns (ok, error_or_None).
+    """
     to_email = (to_email or "").strip()
-    if not to_email or not is_configured():
-        return False
+    if not to_email:
+        return False, "No recipient address."
+    if not is_configured():
+        return False, "No mail provider configured (RESEND_API_KEY / SMTP_HOST)."
     try:
         if _resend_key():
-            return _send_resend(to_email, subject, html, text)
-        return _send_smtp(to_email, subject, html, text)
+            ok = _send_resend(to_email, subject, html, text)
+        else:
+            ok = _send_smtp(to_email, subject, html, text)
+        return ok, None if ok else "Provider rejected the message."
+    except urllib.error.HTTPError as e:
+        # Resend returns a JSON body explaining exactly what's wrong — usually an
+        # unverified sending domain or a bad API key. Surface it verbatim.
+        try:
+            detail = e.read().decode()[:300]
+        except Exception:
+            detail = ""
+        msg = f"HTTP {e.code} from mail provider. {detail}"
+        print(f"[mailer] send failed to {to_email}: {msg}")
+        return False, msg
     except Exception as e:  # noqa: BLE001 - deliberately swallow everything
         print(f"[mailer] send failed to {to_email}: {e}")
-        return False
+        return False, str(e)
 
 
 def _send_resend(to_email, subject, html, text) -> bool:
