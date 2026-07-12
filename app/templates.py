@@ -136,9 +136,12 @@ def home(events, ticket_types_by_event, live_mode, embed=False):
         d, m = date_badge(e["starts_at"])
         accent = e["image_url"] if (e["image_url"] or "").startswith("#") else "#4f46e5"
         _img = (e["image"] or "") if "image" in e.keys() else ""
-        # Use a real cover image when one's set; otherwise fall back to the accent colour.
+        # Show the WHOLE poster (contain), not a cropped middle (cover) — these are
+        # adverts, and cropping would cut off the artwork's edges. Any leftover
+        # space is filled with the accent colour so it still looks deliberate.
         cover_style = (
-            f"background-image:url('{esc(_img)}');background-size:cover;background-position:center"
+            f"background-image:url('{esc(_img)}');background-size:contain;"
+            f"background-repeat:no-repeat;background-position:center;background-color:{esc(accent)}"
             if _img else f"background:{esc(accent)}"
         )
         cards.append(f"""
@@ -156,7 +159,7 @@ def home(events, ticket_types_by_event, live_mode, embed=False):
         grid = ('<div class="card"><div class="body center muted">No events yet. '
                 '<a href="/admin">Create one in the dashboard →</a></div></div>')
     else:
-        grid = f'<div class="grid cols-3">{"".join(cards)}</div>'
+        grid = f'<div class="grid events">{"".join(cards)}</div>'
     heading = "" if embed else (
         '<h1>Upcoming events</h1>'
         '<p class="lead">Find your next night out and grab tickets in seconds.</p>'
@@ -173,9 +176,12 @@ def event_detail(event, ticket_types, live_mode, error=None):
     accent = event["image_url"] if (event["image_url"] or "").startswith("#") else "#4f46e5"
     _img = (event["image"] or "") if "image" in event.keys() else ""
     cover_style = (
-        f"background-image:url('{esc(_img)}');background-size:cover;background-position:center"
+        f"background-image:url('{esc(_img)}');background-size:contain;"
+        f"background-repeat:no-repeat;background-position:center;background-color:{accent}"
         if _img else f"background:{accent}"
     )
+    # A poster deserves room on the event's own page; a plain accent block doesn't.
+    cover_h = "min(70vh, 520px)" if _img else "150px"
     rows = []
     any_available = False
     for t in ticket_types:
@@ -217,7 +223,7 @@ def event_detail(event, ticket_types, live_mode, error=None):
     body = f"""
     <a href="/" class="muted small">← All events</a>
     <div class="card mt2" style="overflow:hidden">
-      <div class="event-cover" style="height:220px;{cover_style}"></div>
+      <div class="event-cover" style="aspect-ratio:auto;height:{cover_h};{cover_style}"></div>
       <div class="body">
         <span class="pill">{esc(d)}</span>
         <h1 class="mt2">{esc(event['title'])}</h1>
@@ -294,7 +300,7 @@ def success(order, event, tickets, qr_svgs, emailed=False, email_on=False):
           <div class="muted small">{esc(event['title'])}</div>
           <div class="muted small">{esc(fmt_date(event['starts_at']))}</div>
           <div class="muted small">{esc(event.get('venue') or '')}</div>
-          <div class="qr" style="background:#fff;padding:14px;border-radius:12px;width:min(240px,70%);margin:16px auto">{qr_svgs[t['code']]}</div>
+          <div class="qr qr-sm">{qr_svgs[t['code']]}</div>
           <div class="code">{esc(t['code'])}</div>
           <a class="btn ghost sm no-print" href="/t/{esc(t['code'])}">Open full ticket</a>
         </div></div>""")
