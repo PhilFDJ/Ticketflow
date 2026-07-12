@@ -541,7 +541,10 @@ def scanner():
           body: JSON.stringify({code})});
         const j = await r.json();
         const cls = j.status==='ok'?'ok':(j.status==='already'?'already':'invalid');
-        const head = j.status==='ok'?'✓ Admitted':(j.status==='already'?'⚠ Already used':'✕ Invalid ticket');
+        const head = j.status==='ok' ? '✓ Admitted'
+                   : j.status==='already' ? '⚠ Already used'
+                   : j.status==='void'    ? '✕ REFUNDED — do not admit'
+                   : '✕ Invalid ticket';
         let detail = '';
         if(j.ticket){ detail = `<div>${j.ticket.event_title}</div>
             <div class="muted small">${j.ticket.ticket_name} · ${j.ticket.buyer_name||''}</div>`;
@@ -1075,14 +1078,22 @@ def admin_terms(terms, saved=False):
     """, admin=True)
 
 
-def admin_orders(orders, summary, status, search):
+def admin_orders(orders, summary, status, search, msg=None, err=None):
     rows = []
     for o in orders:
         paid = o["status"] == "paid"
+        refunded = o["status"] == "refunded"
         when = time.strftime("%d %b, %H:%M", time.localtime(int(o["created_at"])))
         qty = o["ticket_count"] or o["item_qty"] or 0
-        badge = ('<span class="pill ok">Paid</span>' if paid
+        badge = ('<span class="pill bad">Refunded</span>' if refunded
+                 else '<span class="pill ok">Paid</span>' if paid
                  else '<span class="pill warn">Abandoned</span>')
+        action = ("" if not paid else f'''
+          <form method="post" action="/admin/orders/refund" style="margin:0"
+                onsubmit="return confirm('Refund {esc(o["buyer_name"])} {money(o["total"], o["currency"])}?\n\nThis refunds them at Stripe AND voids their tickets.')">
+            <input type="hidden" name="id" value="{esc(o['id'])}">
+            <button class="btn ghost sm" type="submit">Refund</button>
+          </form>''')
         phone = esc(o["buyer_phone"] or "—")
         rows.append(f"""
         <tr class="{'' if paid else 'abandoned'}">
@@ -1100,6 +1111,7 @@ def admin_orders(orders, summary, status, search):
           <td>{qty}</td>
           <td>{money(o['total'], o['currency'])}</td>
           <td>{badge}</td>
+          <td>{action}</td>
         </tr>""")
 
     def tab(label, val):
@@ -1110,6 +1122,8 @@ def admin_orders(orders, summary, status, search):
     return layout("Orders", f"""
     <a href="/admin" class="muted small">← Dashboard</a>
     <h1 class="mt2">All orders</h1>
+    {flash("ok", msg) if msg else ""}
+    {flash("err", err) if err else ""}
     <p class="lead">Every booking across every event, and the carts people didn't finish.</p>
 
     <div class="grid cols-3 mt2">
@@ -1137,7 +1151,7 @@ def admin_orders(orders, summary, status, search):
 
     <div class="card mt2"><div class="body">
       {'<table><thead><tr><th>When</th><th>Customer</th><th>Event</th><th>Tickets</th>'
-       '<th>Total</th><th>Status</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table>'
+       '<th>Total</th><th>Status</th><th></th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table>'
        if rows else '<p class="muted">No orders yet.</p>'}
     </div></div>
 
@@ -1325,6 +1339,8 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
       <a class="btn sec" href="/admin/orders?status=pending">🛒 Abandoned carts</a>
       <a class="btn sec" href="/admin/discounts">🏷️ Discount codes</a>
       <a class="btn sec" href="/admin/terms">📄 Terms &amp; conditions</a>
+      <a class="btn sec" href="/admin/backup"
+         title="Download the whole database. Keep it somewhere that isn't Render.">⤓ Backup database</a>
     </div>
 
     <div class="card mt3"><div class="body">

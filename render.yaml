@@ -65,5 +65,12 @@ services:
       - key: APPLE_WWDR_CERT
         sync: false
 
+      # Stripe webhook — without this, a buyer whose browser dies after paying
+      # never gets their tickets. See WEBHOOK-REFUNDS-BACKUPS.md
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: PUBLIC_BASE_URL
+        value: https://tickets.mayhembingo.co.uk
+
       - key: PYTHON_VERSION
         value: "3.11.9"

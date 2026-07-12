@@ -142,6 +142,10 @@ def _migrate(conn):
         # they agreed to — terms change, so we stamp the version they saw.
         conn.execute("ALTER TABLE orders ADD COLUMN terms_accepted_at INTEGER")
         conn.execute("ALTER TABLE orders ADD COLUMN terms_version INTEGER NOT NULL DEFAULT 0")
+    if "refunded_at" not in ocols:
+        # Refunds: void the tickets so a refunded customer can't still walk in.
+        conn.execute("ALTER TABLE orders ADD COLUMN refunded_at INTEGER")
+        conn.execute("ALTER TABLE orders ADD COLUMN payment_intent TEXT")
 
     ecols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
     if "image" not in ecols:
@@ -591,7 +595,10 @@ def all_orders(status=None, search="", limit=500):
         "FROM orders o JOIN events e ON e.id = o.event_id"
     )
     params, where = [], []
-    if status:
+    if status == "paid":
+        # "Paid" shouldn't include refunded ones — they're a separate state.
+        where.append("o.status = 'paid'")
+    elif status:
         where.append("o.status = ?")
         params.append(status)
     if search:
@@ -938,6 +945,45 @@ def price_tier_summary(tt):
     return None
 
 
+def void_order_tickets(oid, reason="refunded"):
+    """Void every ticket on an order and put the stock back.
+
+    A refund that leaves the ticket scannable is worse than useless — the customer
+    gets their money back AND walks in. Returns how many tickets were voided.
+    """
+    with cursor() as conn:
+        order = conn.execute("SELECT * FROM orders WHERE id = ?", (oid,)).fetchone()
+        if order is None:
+            return 0
+        tickets = conn.execute(
+            "SELECT * FROM tickets WHERE order_id = ? AND status != 'void'",
+            (oid,)).fetchall()
+        n = 0
+        for t in tickets:
+            conn.execute("UPDATE tickets SET status = 'void' WHERE id = ?", (t["id"],))
+            # Return the ticket to stock so it can be resold.
+            conn.execute(
+                "UPDATE ticket_types SET sold = MAX(0, sold - 1) WHERE id = ?",
+                (t["ticket_type_id"],))
+            n += 1
+        conn.execute(
+            "UPDATE orders SET status = ?, refunded_at = ? WHERE id = ?",
+            ("refunded", now(), oid))
+    return n
+
+
+def order_id_for_payment_intent(pi):
+    with cursor() as conn:
+        row = conn.execute(
+            "SELECT id FROM orders WHERE payment_intent = ?", (pi,)).fetchone()
+    return row["id"] if row else None
+
+
+def set_payment_intent(oid, pi):
+    with cursor() as conn:
+        conn.execute("UPDATE orders SET payment_intent = ? WHERE id = ?", (pi, oid))
+
+
 def tickets_for_order(oid):
     with cursor() as conn:
         rows = conn.execute(
@@ -976,6 +1022,11 @@ def redeem_ticket(code):
         row = conn.execute("SELECT * FROM tickets WHERE code = ?", (code,)).fetchone()
         if row is None:
             return "invalid", None
+        if row["status"] == "void":
+            # Refunded or cancelled. Without this check a refunded customer would
+            # get their money back AND still be admitted.
+            full = get_ticket_by_code(code)
+            return "void", full
         if row["status"] == "used":
             full = get_ticket_by_code(code)
             return "already", full

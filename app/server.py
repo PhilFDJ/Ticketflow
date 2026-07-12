@@ -487,6 +487,143 @@ def mock_cancel(h):
 
 
 # ---- success + tickets ---------------------------------------------
+def send_ticket_email(oid, base_url=None):
+    """Email the tickets for a paid order. Exactly once, and never fatally.
+
+    Shared by the success page and the webhook — whichever gets there first sends
+    it. claim_email_send() is atomic, so they can't both send.
+    """
+    order = db.get_order(oid)
+    if not order or order["status"] != "paid":
+        return False
+    if order.get("emailed_at"):
+        return True
+    if not mailer.is_configured():
+        return False
+    if not db.claim_email_send(oid):
+        return True          # another path already claimed it
+
+    event = db.get_event(order["event_id"])
+    tickets = db.tickets_for_order(oid)
+    base = base_url or public_base_url()
+    ok = mailer.send(
+        order["buyer_email"],
+        f"Your tickets — {event['title']}",
+        mailer.ticket_email_html(event, tickets, base),
+        mailer.ticket_email_text(event, tickets, base),
+    )
+    if not ok:
+        db.mark_email_unsent(oid)   # let it retry
+    return ok
+
+
+def public_base_url():
+    """Our own URL, for links in emails sent from a webhook (no request context)."""
+    return os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/") \
+        or "https://tickets.mayhembingo.co.uk"
+
+
+@route("POST", "/webhooks/stripe")
+def stripe_webhook(h):
+    """Stripe tells us directly when a payment succeeds.
+
+    WHY THIS EXISTS
+    Previously a ticket was only issued when the buyer's browser landed back on
+    /checkout/success. If they closed the tab, lost signal, or their phone died
+    during the redirect, Stripe took their money and they got NOTHING. This is the
+    standard failure mode of redirect-only checkout, and it's the one that turns up
+    at your door with a bank statement and no QR code.
+
+    Stripe calls this endpoint server-to-server, so it works even if the buyer's
+    browser never comes back.
+    """
+    raw = h.read_body()
+    sig = h.headers.get("Stripe-Signature", "")
+
+    try:
+        event = payments.verify_webhook(raw, sig)
+    except Exception as e:
+        # Do NOT trust an unverified webhook — a fake one would mint free tickets.
+        print(f"[webhook] rejected: {e}")
+        return h.send_json({"error": str(e)}, 400)
+
+    etype = event.get("type", "")
+    obj = (event.get("data") or {}).get("object") or {}
+
+    if etype == "checkout.session.completed":
+        # Stash the payment intent — refunds need it.
+        _oid = ((obj.get("metadata") or {}).get("order_id")
+                or obj.get("client_reference_id") or "")
+        if _oid and obj.get("payment_intent"):
+            db.set_payment_intent(_oid, obj["payment_intent"])
+        # The session may complete before payment settles (rare, but real).
+        if obj.get("payment_status") not in ("paid", "no_payment_required"):
+            print(f"[webhook] session complete but unpaid: {obj.get('payment_status')}")
+            return h.send_json({"ok": True, "ignored": "unpaid"})
+        oid = ((obj.get("metadata") or {}).get("order_id")
+               or obj.get("client_reference_id") or "")
+        _fulfil_order(oid, source="webhook")
+
+    elif etype == "checkout.session.async_payment_succeeded":
+        oid = ((obj.get("metadata") or {}).get("order_id")
+               or obj.get("client_reference_id") or "")
+        _fulfil_order(oid, source="webhook(async)")
+
+    elif etype == "charge.refunded":
+        # Someone refunded in the Stripe dashboard — void the tickets so a refunded
+        # customer can't still walk in.
+        _void_refunded(obj)
+
+    # Always 200 for anything we understood, or Stripe will retry forever.
+    return h.send_json({"ok": True})
+
+
+def _fulfil_order(oid, source="webhook"):
+    """Mark paid, issue tickets, send the email. Safe to call twice.
+
+    mark_order_paid() is idempotent and the mailer claims its send atomically, so
+    the webhook and the success page racing each other is harmless — whichever
+    arrives first does the work.
+    """
+    if not oid:
+        print(f"[{source}] no order_id on the event — cannot fulfil")
+        return
+    order = db.get_order(oid)
+    if not order:
+        print(f"[{source}] unknown order {oid}")
+        return
+    if order["status"] == "paid":
+        return          # already done (probably by the success page)
+
+    try:
+        db.mark_order_paid(oid)
+        print(f"[{source}] fulfilled order {oid}")
+    except Exception as e:
+        print(f"[{source}] FAILED to fulfil {oid}: {e}")
+        return
+
+    # Email the tickets. Never let a mail failure break fulfilment.
+    try:
+        send_ticket_email(oid)
+    except Exception as e:
+        print(f"[{source}] ticket email failed for {oid}: {e}")
+
+
+def _void_refunded(charge):
+    """Void the tickets on a refunded order, so a refunded customer can't get in."""
+    oid = (charge.get("metadata") or {}).get("order_id", "")
+    if not oid:
+        # Fall back to the payment intent -> our stored session
+        pi = charge.get("payment_intent")
+        if pi:
+            oid = db.order_id_for_payment_intent(pi) or ""
+    if not oid:
+        print("[webhook] refund with no traceable order")
+        return
+    n = db.void_order_tickets(oid, reason="refunded")
+    print(f"[webhook] refunded order {oid} — voided {n} ticket(s)")
+
+
 @route("GET", "/checkout/success")
 def success(h):
     oid = h.query.get("order", "")
@@ -510,20 +647,10 @@ def success(h):
     tickets = db.tickets_for_order(oid)
     svgs = {t["code"]: qr_svg(t["code"]) for t in tickets}
 
-    # Email the tickets — exactly once per order, and never fatally. A failed
-    # email must not stop the buyer seeing the tickets they've just paid for.
-    emailed = bool(order.get("emailed_at"))
-    if not emailed and mailer.is_configured() and db.claim_email_send(oid):
-        ok = mailer.send(
-            order["buyer_email"],
-            f"Your tickets — {event['title']}",
-            mailer.ticket_email_html(event, tickets, h.base_url()),
-            mailer.ticket_email_text(event, tickets, h.base_url()),
-        )
-        if ok:
-            emailed = True
-        else:
-            db.mark_email_unsent(oid)  # let it retry on refresh
+    # Email the tickets — exactly once per order, and never fatally. The webhook
+    # may already have done this; send_ticket_email() handles that safely.
+    send_ticket_email(oid, h.base_url())
+    emailed = bool(db.get_order(oid).get("emailed_at"))
 
     h.send_html(T.success(order, event, tickets, svgs,
                           emailed=emailed, email_on=mailer.is_configured()))
@@ -687,6 +814,49 @@ def admin_archive_past(h):
         db.archive_event(e["id"], True)
         n += 1
     h.redirect(f"/admin?archived={n}")
+
+
+@route("GET", "/admin/backup")
+def admin_backup(h):
+    """Download the whole database.
+
+    Everything — orders, tickets, customers — lives in one SQLite file on a Render
+    disk that isn't backed up. If it dies, the business dies with it. This is the
+    pragmatic mitigation: press the button, keep the file somewhere else.
+
+    Uses SQLite's backup API rather than copying the file, so it's safe to do while
+    the site is live and taking orders.
+    """
+    if not require_admin(h):
+        return
+    import sqlite3
+    import tempfile
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    try:
+        src = sqlite3.connect(db.DB_PATH)
+        dst = sqlite3.connect(tmp.name)
+        with dst:
+            src.backup(dst)      # consistent snapshot, even mid-write
+        dst.close()
+        src.close()
+        with open(tmp.name, "rb") as f:
+            data = f.read()
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+    stamp = time.strftime("%Y-%m-%d-%H%M")
+    h.send_response(200)
+    h.send_header("Content-Type", "application/octet-stream")
+    h.send_header("Content-Disposition",
+                  f'attachment; filename="mayhem-tickets-{stamp}.db"')
+    h.send_header("Content-Length", str(len(data)))
+    h.end_headers()
+    h.wfile.write(data)
 
 
 @route("GET", "/admin/archive")
@@ -871,6 +1041,32 @@ def admin_discounts_delete(h):
     h.redirect("/admin/discounts")
 
 
+@route("POST", "/admin/orders/refund")
+def admin_refund(h):
+    """Refund an order at Stripe AND void its tickets, in one action.
+
+    Doing these separately is how a refunded customer ends up still able to walk
+    in — you refund in the Stripe dashboard, forget to void the ticket, and it
+    still scans green at the door.
+    """
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    oid = flat.get("id", "")
+    order = db.get_order(oid)
+    if not order:
+        return h.redirect("/admin/orders?err=Unknown+order")
+    if order["status"] == "refunded":
+        return h.redirect("/admin/orders?msg=Already+refunded")
+
+    ok, msg = payments.refund_order(order)
+    if not ok:
+        return h.redirect(f"/admin/orders?err={urllib.parse.quote('Refund failed: ' + msg)}")
+
+    n = db.void_order_tickets(oid, reason="refunded")
+    h.redirect(f"/admin/orders?msg={urllib.parse.quote(f'Refunded. {n} ticket(s) voided and put back on sale.')}")
+
+
 @route("GET", "/admin/orders")
 def admin_orders(h):
     """Every order across every event, in one place — including abandoned carts."""
@@ -881,7 +1077,8 @@ def admin_orders(h):
         status = ""
     search = (h.query.get("q") or "").strip()
     orders = db.all_orders(status=status or None, search=search)
-    h.send_html(T.admin_orders(orders, db.orders_summary(), status, search))
+    h.send_html(T.admin_orders(orders, db.orders_summary(), status, search,
+                               msg=h.query.get("msg"), err=h.query.get("err")))
 
 
 @route("GET", "/admin/orders.csv")

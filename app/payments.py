@@ -7,6 +7,7 @@ runs end-to-end out of the box.
 """
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -51,6 +52,58 @@ def fee_label():
     """What the booking fee is called on the Stripe receipt and at checkout."""
     import db as _db
     return _db.fee_config()["label"]
+
+
+def webhook_secret():
+    return os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+
+
+def verify_webhook(payload: bytes, sig_header: str, tolerance=300):
+    """Verify a Stripe webhook signature. Returns the parsed event, or raises.
+
+    This is NOT optional. Without it, anyone who finds the webhook URL could POST
+    a fake "payment succeeded" event and mint themselves free tickets. Stripe signs
+    every webhook with a shared secret; we recompute the signature and compare.
+    """
+    import hashlib
+    import hmac
+
+    secret = webhook_secret()
+    if not secret:
+        raise ValueError("STRIPE_WEBHOOK_SECRET is not set.")
+    if not sig_header:
+        raise ValueError("No Stripe-Signature header.")
+
+    # Header looks like: t=1614556800,v1=abc123...,v1=def456...
+    parts = {}
+    for chunk in sig_header.split(","):
+        if "=" not in chunk:
+            continue
+        k, v = chunk.split("=", 1)
+        parts.setdefault(k.strip(), []).append(v.strip())
+
+    timestamps = parts.get("t", [])
+    signatures = parts.get("v1", [])
+    if not timestamps or not signatures:
+        raise ValueError("Malformed Stripe-Signature header.")
+
+    ts = timestamps[0]
+    # Reject old events — stops someone replaying a captured webhook later.
+    try:
+        age = abs(int(time.time()) - int(ts))
+    except ValueError:
+        raise ValueError("Bad timestamp in signature.")
+    if age > tolerance:
+        raise ValueError(f"Webhook timestamp is {age}s old — rejected.")
+
+    signed = f"{ts}.".encode() + payload
+    expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+
+    # constant-time compare against each provided signature
+    if not any(hmac.compare_digest(expected, s) for s in signatures):
+        raise ValueError("Webhook signature did not match.")
+
+    return json.loads(payload.decode())
 
 
 def _form_encode(data, parent=None):
@@ -149,6 +202,53 @@ def create_checkout(order, items, event, base_url):
 
     session = _stripe_post("/checkout/sessions", payload)
     return session["url"], "stripe", session["id"]
+
+
+def refund_order(order):
+    """Refund a Stripe payment in full. Returns (ok, message).
+
+    Only handles the Stripe side — voiding the tickets is the caller's job (see
+    db.void_order_tickets), because a mock/cash order still needs voiding.
+    """
+    if not is_live():
+        return True, "Mock order — nothing to refund at Stripe."
+    pi = order.get("payment_intent")
+    if not pi:
+        # Fall back: look the session up to find its payment intent.
+        sid = order.get("session_id")
+        if not sid:
+            return False, "No Stripe payment recorded for this order."
+        try:
+            session = _stripe_get(f"/checkout/sessions/{sid}")
+            pi = session.get("payment_intent")
+        except Exception as e:
+            return False, f"Couldn't find the Stripe payment: {e}"
+    if not pi:
+        return False, "No Stripe payment intent on this order."
+    try:
+        _stripe_post("/refunds", {"payment_intent": pi})
+        return True, "Refunded at Stripe."
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode())["error"]["message"]
+        except Exception:
+            detail = f"HTTP {e.code}"
+        # Already refunded is not a failure — carry on and void the tickets.
+        if "already been refunded" in detail.lower():
+            return True, "Already refunded at Stripe."
+        return False, detail
+    except Exception as e:
+        return False, str(e)
+
+
+def _stripe_get(path):
+    req = urllib.request.Request(
+        f"https://api.stripe.com/v1{path}",
+        headers={"Authorization": f"Bearer {stripe_key()}",
+                 "User-Agent": "MayhemBingoTickets/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode())
 
 
 def session_is_paid(session_id):
