@@ -1,4 +1,4 @@
-"""SQLite data layer for TicketFlow (Python stdlib only)."""
+"""SQLite data layer for Mayhem Bingo tickets (Python stdlib only)."""
 import os
 import sqlite3
 import time
@@ -68,6 +68,21 @@ CREATE TABLE IF NOT EXISTS tickets (
 """
 
 
+def _migrate(conn):
+    """Additive migrations, safe to run on every boot."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+    if "emailed_at" not in cols:
+        # When the buyer's ticket email was sent (null = not sent yet). Lets the
+        # success page be refreshed without spamming them with duplicate emails.
+        conn.execute("ALTER TABLE orders ADD COLUMN emailed_at INTEGER")
+
+    ecols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+    if "image" not in ecols:
+        # A real cover image (uploaded file path or external URL). The original
+        # `image_url` column was misnamed — it only ever held a hex accent colour.
+        conn.execute("ALTER TABLE events ADD COLUMN image TEXT NOT NULL DEFAULT ''")
+
+
 def connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -88,6 +103,27 @@ def cursor():
 def init_db():
     with cursor() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def claim_email_send(oid) -> bool:
+    """Atomically claim the right to send this order's ticket email.
+
+    Returns True for exactly one caller; False if it's already been sent. This
+    stops a refreshed success page emailing the buyer twice.
+    """
+    with cursor() as conn:
+        cur = conn.execute(
+            "UPDATE orders SET emailed_at = ? WHERE id = ? AND emailed_at IS NULL",
+            (now(), oid),
+        )
+        return cur.rowcount == 1
+
+
+def mark_email_unsent(oid):
+    """Release the claim if sending actually failed, so it can be retried."""
+    with cursor() as conn:
+        conn.execute("UPDATE orders SET emailed_at = NULL WHERE id = ?", (oid,))
 
 
 def now() -> int:

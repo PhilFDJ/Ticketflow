@@ -22,6 +22,10 @@ header.site{
 header.site .container{display:flex;align-items:center;justify-content:space-between;height:64px}
 .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;color:var(--ink)}
 .brand:hover{text-decoration:none}
+/* Mayhem Bingo wordmark. The logo has its own black outline and drop shadow, so
+   it reads fine on the dark header without any extra treatment. */
+.brandlogo{height:42px;width:auto;display:block}
+@media(max-width:560px){.brandlogo{height:34px}}
 .brand .logo{width:30px;height:30px;border-radius:8px;
   background:linear-gradient(135deg,var(--brand),#22d3ee);display:grid;place-items:center;color:white;font-size:16px}
 .nav a{color:var(--muted);margin-left:18px;font-weight:500}
@@ -102,6 +106,7 @@ tr:last-child td{border-bottom:0}
 .ticket{background:linear-gradient(180deg,#141e36,#0f1728);border:1px solid var(--line);
   border-radius:16px;overflow:hidden;max-width:420px;margin:0 auto}
 .ticket .top{padding:20px 22px;border-bottom:1px dashed var(--line);position:relative}
+.ticketlogo{height:38px;width:auto;display:block;margin:0 auto 10px}
 .ticket .qr{background:#fff;padding:14px;border-radius:12px;display:grid;place-items:center;margin:18px auto;width:min(260px,80%)}
 .ticket .qr svg{width:100%;height:auto;display:block}
 .ticket .code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.05em;
@@ -128,3 +133,46 @@ hr.sep{border:0;border-top:1px solid var(--line);margin:24px 0}
 footer.site{border-top:1px solid var(--line);color:var(--muted);font-size:13px;padding:24px 0}
 .banner{background:linear-gradient(90deg,rgba(99,102,241,.15),rgba(34,211,238,.08));
   border:1px solid var(--line);border-radius:12px;padding:12px 16px;font-size:13px;color:var(--muted);margin-bottom:20px}
+
+/* ===================================================================
+   PRINT — the site is dark-themed; printed dark backgrounds waste ink
+   and, critically, a QR must be BLACK ON WHITE to scan. Force light,
+   strip the site chrome, and keep one ticket per page.
+   =================================================================== */
+@media print{
+  @page{margin:12mm}
+  html,body{background:#fff !important;color:#000 !important}
+  header.site,footer.site,.nav,.banner,.no-print,.flash{display:none !important}
+  main{padding:0 !important}
+  .container,.narrow{max-width:100% !important;padding:0 !important}
+  a[href]:after{content:""}           /* don't print URLs after links */
+
+  .card,.ticket{
+    background:#fff !important;
+    border:1px solid #000 !important;
+    box-shadow:none !important;
+    break-inside:avoid; page-break-inside:avoid;
+  }
+  .ticket-print{break-after:page; page-break-after:always}
+  .ticket-print:last-child{break-after:auto; page-break-after:auto}
+
+  h1,h2,h3,.title{color:#000 !important}
+  .muted,.small,.code{color:#333 !important}
+  .pill{border:1px solid #000 !important;background:#fff !important;color:#000 !important}
+
+  /* The QR itself: solid white ground, pure black modules, big enough to scan */
+  .qr{
+    background:#fff !important; padding:8px !important;
+    width:58mm !important; margin:8px auto !important;
+    border:0 !important;
+  }
+  .qr svg{width:100% !important;height:auto !important}
+  .qr svg rect[fill="#fff"],.qr svg rect[fill="#ffffff"]{fill:#fff !important}
+  .qr svg path,.qr svg rect{shape-rendering:crispEdges}
+
+  .code{font-size:12px !important;letter-spacing:.06em}
+  .notch{display:none !important}
+  /* Keep the branding on a printed ticket — it's what someone hands over at the door. */
+  .ticketlogo{height:30mm !important;max-height:26mm !important;width:auto !important;
+    margin:0 auto 4mm !important;display:block !important}
+}

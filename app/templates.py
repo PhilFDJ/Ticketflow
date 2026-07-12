@@ -1,4 +1,4 @@
-"""HTML rendering for TicketFlow. Pure string templating, stdlib only."""
+"""HTML rendering for Mayhem Bingo tickets. Pure string templating, stdlib only."""
 import html
 import time
 
@@ -7,6 +7,15 @@ CURRENCY_SYMBOL = {"GBP": "£", "USD": "$", "EUR": "€"}
 
 def esc(s):
     return html.escape(str(s if s is not None else ""))
+
+
+def _nl2br(s):
+    """Escape text, then turn real line breaks into <br>.
+
+    Browsers submit textarea newlines as CRLF, so normalise those first or a
+    multi-paragraph event description renders as one run-on blob.
+    """
+    return esc(s).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
 
 
 def money(pence, currency="GBP"):
@@ -36,7 +45,7 @@ def date_badge(ts):
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
-def layout(title, body, active="", admin=False):
+def layout(title, body, active="", admin=False, embed=False):
     nav = (
         f'<a href="/" class="{ "active" if active=="home" else "" }">Events</a>'
         f'<a href="/scan">Scan</a>'
@@ -45,24 +54,63 @@ def layout(title, body, active="", admin=False):
         nav += '<a href="/admin">Dashboard</a><a href="/admin/logout">Sign out</a>'
     else:
         nav += '<a href="/admin">Organiser</a>'
+
+    if embed:
+        # Embedded in another site (mayhembingo.co.uk): no header, footer or nav —
+        # the host page provides those. Transparent background so it sits on their
+        # design, and it posts its height up so the iframe can size itself.
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{esc(title)} · Mayhem Bingo</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  html,body{{background:transparent !important}}
+  body{{min-height:0}}
+  main{{padding:0}}
+  .container{{padding:0}}
+</style>
+</head>
+<body class="embedded">
+<main><div class="container">
+{body}
+</div></main>
+<script>
+  // Tell the parent page how tall we are, so the iframe can resize to fit
+  // instead of showing an inner scrollbar.
+  function _postHeight() {{
+    var h = document.documentElement.scrollHeight;
+    try {{ parent.postMessage({{ ticketflowHeight: h }}, "*"); }} catch (e) {{}}
+  }}
+  window.addEventListener("load", _postHeight);
+  window.addEventListener("resize", _postHeight);
+  new ResizeObserver(_postHeight).observe(document.body);
+</script>
+</body>
+</html>"""
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(title)} · TicketFlow</title>
+<title>{esc(title)} · Mayhem Bingo</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header class="site"><div class="container">
-  <a class="brand" href="/"><span class="logo">◆</span> TicketFlow</a>
+  <a class="brand" href="/"><img src="/static/logo.png" alt="Mayhem Bingo" class="brandlogo"></a>
   <nav class="nav">{nav}</nav>
 </div></header>
 <main><div class="container">
 {body}
 </div></main>
 <footer class="site"><div class="container">
-  TicketFlow — a self-hosted ticketing MVP. Prices in test mode.
+  Mayhem Bingo · tickets
 </div></footer>
 </body>
 </html>"""
@@ -75,7 +123,7 @@ def flash(kind, msg):
 # ---------------------------------------------------------------------------
 # Public pages
 # ---------------------------------------------------------------------------
-def home(events, ticket_types_by_event, live_mode):
+def home(events, ticket_types_by_event, live_mode, embed=False):
     banner = ("" if live_mode else
               '<div class="banner">💳 <b>Mock payment mode</b> — no Stripe key set, '
               'so checkout is simulated and no real card is charged. '
@@ -86,10 +134,16 @@ def home(events, ticket_types_by_event, live_mode):
         prices = [t["price"] for t in tts if (t["quantity"] - t["sold"]) > 0]
         price_label = ("From " + money(min(prices), e["currency"])) if prices else "Sold out"
         d, m = date_badge(e["starts_at"])
-        cover = e["image_url"] if e["image_url"].startswith("#") else "#4f46e5"
+        accent = e["image_url"] if (e["image_url"] or "").startswith("#") else "#4f46e5"
+        _img = (e["image"] or "") if "image" in e.keys() else ""
+        # Use a real cover image when one's set; otherwise fall back to the accent colour.
+        cover_style = (
+            f"background-image:url('{esc(_img)}');background-size:cover;background-position:center"
+            if _img else f"background:{esc(accent)}"
+        )
         cards.append(f"""
-        <a class="card event-card" href="/events/{esc(e['id'])}">
-          <div class="event-cover" style="background:{esc(cover)}">
+        <a class="card event-card" href="/events/{esc(e['id'])}"{' target="_top"' if embed else ''}>
+          <div class="event-cover" style="{cover_style}">
             <div class="date"><div class="d">{d}</div><div class="m">{m}</div></div>
           </div>
           <div class="body">
@@ -103,17 +157,25 @@ def home(events, ticket_types_by_event, live_mode):
                 '<a href="/admin">Create one in the dashboard →</a></div></div>')
     else:
         grid = f'<div class="grid cols-3">{"".join(cards)}</div>'
+    heading = "" if embed else (
+        '<h1>Upcoming events</h1>'
+        '<p class="lead">Find your next night out and grab tickets in seconds.</p>'
+    )
     return layout("Events", f"""
     {banner}
-    <h1>Upcoming events</h1>
-    <p class="lead">Find your next night out and grab tickets in seconds.</p>
+    {heading}
     {grid}
-    """, active="home")
+    """, active="home", embed=embed)
 
 
 def event_detail(event, ticket_types, live_mode, error=None):
     d = fmt_date(event["starts_at"])
-    cover = event["image_url"] if event["image_url"].startswith("#") else "#4f46e5"
+    accent = event["image_url"] if (event["image_url"] or "").startswith("#") else "#4f46e5"
+    _img = (event["image"] or "") if "image" in event.keys() else ""
+    cover_style = (
+        f"background-image:url('{esc(_img)}');background-size:cover;background-position:center"
+        if _img else f"background:{accent}"
+    )
     rows = []
     any_available = False
     for t in ticket_types:
@@ -155,12 +217,12 @@ def event_detail(event, ticket_types, live_mode, error=None):
     body = f"""
     <a href="/" class="muted small">← All events</a>
     <div class="card mt2" style="overflow:hidden">
-      <div class="event-cover" style="height:150px;background:{esc(cover)}"></div>
+      <div class="event-cover" style="height:220px;{cover_style}"></div>
       <div class="body">
         <span class="pill">{esc(d)}</span>
         <h1 class="mt2">{esc(event['title'])}</h1>
         <p class="lead">{esc(event['venue'])}</p>
-        <p>{esc(event['description'])}</p>
+        <p>{_nl2br(event['description'])}</p>
       </div>
     </div>
     <div class="card mt3"><div class="body">
@@ -221,37 +283,52 @@ def mock_pay(order, event, base_url):
     </div>""")
 
 
-def success(order, event, tickets, qr_svgs):
+def success(order, event, tickets, qr_svgs, emailed=False, email_on=False):
     tks = []
     for t in tickets:
         tks.append(f"""
-        <div class="card mt2"><div class="body center">
+        <div class="card mt2 ticket-print"><div class="body center">
+          <img src="/static/logo.png" alt="Mayhem Bingo" class="ticketlogo">
           <div class="pill ok">Valid ticket</div>
           <h3 class="mt2">{esc(t['ticket_name'])}</h3>
           <div class="muted small">{esc(event['title'])}</div>
+          <div class="muted small">{esc(fmt_date(event['starts_at']))}</div>
+          <div class="muted small">{esc(event.get('venue') or '')}</div>
           <div class="qr" style="background:#fff;padding:14px;border-radius:12px;width:min(240px,70%);margin:16px auto">{qr_svgs[t['code']]}</div>
           <div class="code">{esc(t['code'])}</div>
-          <a class="btn ghost sm" href="/t/{esc(t['code'])}">Open full ticket</a>
+          <a class="btn ghost sm no-print" href="/t/{esc(t['code'])}">Open full ticket</a>
         </div></div>""")
+
+    if emailed:
+        mail_line = (f'<p class="muted small no-print">📧 We\'ve emailed your tickets to '
+                     f'<b>{esc(order["buyer_email"])}</b>.</p>')
+    elif email_on:
+        mail_line = ('<p class="muted small no-print">We couldn\'t email your tickets just now — '
+                     '<b>please screenshot or print this page</b>, or keep the ticket links.</p>')
+    else:
+        mail_line = ('<p class="muted small no-print"><b>Save these now</b> — screenshot or print '
+                     'this page, or keep the ticket links. They aren\'t emailed.</p>')
+
     return layout("You're in!", f"""
     <div class="narrow" style="margin:0 auto">
       <div class="center">
         <div class="pill ok">Payment successful</div>
         <h1 class="mt2">You're going! 🎉</h1>
         <p class="lead">{len(tickets)} ticket{'s' if len(tickets)!=1 else ''} for
-          <b>{esc(event['title'])}</b>.<br>We've kept them here — show the QR at the door.</p>
-        <p class="muted small">A confirmation would be emailed to {esc(order['buyer_email'])}
-          in a production setup.</p>
+          <b>{esc(event['title'])}</b>.<br>Show the QR at the door.</p>
+        {mail_line}
+        <p class="no-print"><button class="btn ghost sm" onclick="window.print()">🖨️ Print tickets</button></p>
       </div>
       {''.join(tks)}
-      <div class="center mt3"><a href="/" class="muted">← Back to events</a></div>
+      <div class="center mt3 no-print"><a href="/" class="muted">← Back to events</a></div>
     </div>""")
 
 
 def ticket_page(t, qr_svg):
     return layout("Ticket", f"""
-    <div class="ticket">
+    <div class="ticket ticket-print">
       <div class="top">
+        <img src="/static/logo.png" alt="Mayhem Bingo" class="ticketlogo">
         <div class="pill {'ok' if t['status']=='valid' else 'warn'}">
           {'Valid' if t['status']=='valid' else 'Already used'}</div>
         <h2 class="mt2 mt0">{esc(t['event_title'])}</h2>
@@ -263,7 +340,10 @@ def ticket_page(t, qr_svg):
       <div class="qr">{qr_svg}</div>
       <div class="code">{esc(t['code'])}</div>
     </div>
-    <div class="center mt3"><a href="/" class="muted">← All events</a></div>
+    <div class="center mt3 no-print">
+      <button class="btn ghost sm" onclick="window.print()">🖨️ Print ticket</button>
+    </div>
+    <div class="center mt2 no-print"><a href="/" class="muted">← All events</a></div>
     """)
 
 
@@ -280,8 +360,9 @@ def scanner():
       <div class="center mt2">
         <button class="btn ghost" id="startbtn" onclick="startScan()">Start camera</button>
       </div>
-      <p class="muted small center mt2">Camera needs a secure context. On desktop, localhost works.
-        For a phone, run the server over your LAN with HTTPS or use the manual box below.</p>
+      <p class="muted small center mt2">Works on any phone. If the camera won't open,
+        check the address starts with <b>https://</b> and that you've allowed camera access —
+        or use the manual box below.</p>
       <div class="card mt3"><div class="body">
         <label>Or enter a code manually</label>
         <div class="row">
@@ -290,6 +371,7 @@ def scanner():
         </div>
       </div></div>
     </div>
+    <script src="/static/qrscan.js"></script>
     <script>
     let last = "", lastAt = 0, running = false;
     async function check(code){
@@ -318,35 +400,74 @@ def scanner():
     }
     async function startScan(){
       if(running) return;
-      if(!('BarcodeDetector' in window)){
-        document.getElementById('out').innerHTML =
-          '<div class="scan-result already"><div class="big">Camera scanning unavailable</div>'+
-          '<div class="muted small">This browser lacks BarcodeDetector. Use the manual box, '+
-          'or try Chrome/Safari on a phone.</div></div>';
+      const reader = document.getElementById('reader');
+      const out = document.getElementById('out');
+
+      // getUserMedia only exists in a secure context (https:// or localhost).
+      if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+        out.innerHTML =
+          '<div class="scan-result invalid"><div class="big">Camera unavailable</div>'+
+          '<div class="muted small">The camera needs an <b>https://</b> address. '+
+          'Use the manual box below.</div></div>';
         return;
       }
-      const det = new BarcodeDetector({formats:['qr_code']});
-      const reader = document.getElementById('reader');
+
+      // BarcodeDetector is Chrome-only — iOS Safari and Firefox lack it — so fall
+      // back to our own decoder rather than refusing to scan.
+      let det = null;
+      if('BarcodeDetector' in window){
+        try{ det = new BarcodeDetector({formats:['qr_code']}); }catch(e){ det = null; }
+      }
+      const useFallback = !det;
+
       const video = document.createElement('video');
-      video.setAttribute('playsinline','');
+      video.setAttribute('playsinline','');   // iOS: don't hijack into fullscreen
+      video.setAttribute('muted','');
+      video.muted = true;
       reader.innerHTML=''; reader.appendChild(video);
+
       let stream;
       try{
-        stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+        stream = await navigator.mediaDevices.getUserMedia(
+          {video:{facingMode:{ideal:'environment'}}, audio:false});
       }catch(e){
-        document.getElementById('out').innerHTML =
+        out.innerHTML =
           '<div class="scan-result invalid"><div class="big">Camera blocked</div>'+
-          '<div class="muted small">Allow camera access and reload.</div></div>';
+          '<div class="muted small">Allow camera access for this site, then reload. '+
+          'On iPhone: aA menu → Website Settings → Camera → Allow.</div></div>';
         return;
       }
       video.srcObject = stream; await video.play();
-      running = true; document.getElementById('startbtn').textContent = 'Scanning…';
+      running = true;
+      document.getElementById('startbtn').textContent =
+        useFallback ? 'Scanning…' : 'Scanning…';
+
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d', {willReadFrequently:true});
+      let busy = false, lastHit = 0;
+
       const loop = async () => {
         if(!running) return;
+        const now = Date.now();
         try{
-          const codes = await det.detect(video);
-          if(codes.length) check(codes[0].rawValue);
-        }catch(e){}
+          if(det){
+            const codes = await det.detect(video);
+            if(codes.length && now - lastHit > 1500){ lastHit = now; check(codes[0].rawValue); }
+          }else if(!busy && video.videoWidth){
+            busy = true;
+            // Downscale for speed — a QR is still readable at ~480px, and this
+            // keeps the decode fast enough to feel live on an older phone.
+            const scale = Math.min(1, 480 / video.videoWidth);
+            canvas.width  = Math.round(video.videoWidth  * scale);
+            canvas.height = Math.round(video.videoHeight * scale);
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            let text = null;
+            try{ text = QRScan.decode(img); }catch(e){ text = null; }
+            if(text && now - lastHit > 1500){ lastHit = now; check(text); }
+            busy = false;
+          }
+        }catch(e){ busy = false; }
         requestAnimationFrame(loop);
       };
       loop();
@@ -431,7 +552,7 @@ def admin_new_event(error=None):
     <a href="/admin" class="muted small">← Dashboard</a>
     <h1 class="mt2">Create event</h1>
     {err}
-    <form method="post" action="/admin/events/new">
+    <form method="post" action="/admin/events/new" enctype="multipart/form-data">
       <div class="card"><div class="body">
         <label>Title</label>
         <input name="title" required placeholder="Friday Night Live">
@@ -449,7 +570,11 @@ def admin_new_event(error=None):
               <option value="EUR">EUR €</option>
             </select></div>
         </div>
-        <label>Accent colour</label>
+        <label>Event image <span class="muted small">(optional — a poster or photo)</span></label>
+        <input name="image_file" type="file" accept="image/*">
+        <label class="mt2">…or paste an image URL</label>
+        <input name="image" type="url" placeholder="https://…  (leave blank if uploading a file)">
+        <label class="mt2">Accent colour <span class="muted small">(used if there's no image)</span></label>
         <input name="image_url" type="color" value="#4f46e5" style="height:44px;padding:4px">
       </div></div>
 
@@ -463,6 +588,26 @@ def admin_new_event(error=None):
       <div class="mt3"><button class="btn" type="submit">Create event</button></div>
     </form>"""
     return layout("New event", form + _NEW_EVENT_SCRIPT, admin=True)
+
+
+def _dtlocal(ts):
+    """Unix seconds → the YYYY-MM-DDTHH:MM a datetime-local input expects."""
+    import time as _t
+    return _t.strftime("%Y-%m-%dT%H:%M", _t.localtime(int(ts)))
+
+
+def _cover_preview(event):
+    """Show the current cover image (with a remove tickbox) if one is set."""
+    img = (event["image"] or "") if "image" in event.keys() else ""
+    if not img:
+        return '<p class="muted small">No image set — the accent colour is used instead.</p>'
+    return (
+        f'<div style="margin:6px 0 10px">'
+        f'<img src="{esc(img)}" alt="" style="max-width:220px;border-radius:10px;display:block">'
+        f'<label class="field-inline mt1" style="font-size:13px">'
+        f'<input type="checkbox" name="remove_image" value="1" style="width:auto"> '
+        f'Remove this image</label></div>'
+    )
 
 
 def admin_event(event, ticket_types, stats, orders, live_mode):
@@ -505,6 +650,33 @@ def admin_event(event, ticket_types, stats, orders, live_mode):
       <div class="stat"><div class="n">{money(stats['revenue'], event['currency'])}</div><div class="l">Revenue</div></div>
       <div class="stat"><div class="n">{stats['scanned']}</div><div class="l">Checked in</div></div>
     </div>
+
+    <div class="card mt3"><div class="body">
+      <h2 class="mt0">Event details</h2>
+      <form method="post" action="/admin/events/edit" enctype="multipart/form-data">
+        <input type="hidden" name="id" value="{esc(event['id'])}">
+        <label>Title</label>
+        <input name="title" value="{esc(event['title'])}" required>
+        <div class="row">
+          <div><label>Venue</label>
+            <input name="venue" value="{esc(event['venue'])}"></div>
+          <div><label>Date &amp; time</label>
+            <input name="starts_at" type="datetime-local" value="{_dtlocal(event['starts_at'])}"></div>
+        </div>
+        <label>Description</label>
+        <textarea name="description" placeholder="Tell people what to expect…">{esc(event['description'])}</textarea>
+
+        <label class="mt2">Event image</label>
+        {_cover_preview(event)}
+        <input name="image_file" type="file" accept="image/*">
+        <label class="mt2">…or paste an image URL</label>
+        <input name="image" type="url" placeholder="https://…">
+        <label class="mt2">Accent colour <span class="muted small">(used if there's no image)</span></label>
+        <input name="image_url" type="color" value="{esc(event['image_url'] if (event['image_url'] or '').startswith('#') else '#4f46e5')}" style="height:44px;padding:4px">
+
+        <div class="mt3"><button class="btn" type="submit">Save changes</button></div>
+      </form>
+    </div></div>
 
     <div class="card mt3"><div class="body">
       <h2 class="mt0">Ticket types</h2>

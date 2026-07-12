@@ -22,6 +22,11 @@ services:
       - key: TICKETFLOW_DB
         value: /var/data/ticketflow.db
 
+      # Event images live on the SAME persistent disk as the database — the normal
+      # filesystem is wiped on every deploy, so uploads stored elsewhere would vanish.
+      - key: TICKETFLOW_UPLOADS
+        value: /var/data/uploads
+
       # Organiser dashboard password. Set a real one in the Render dashboard.
       - key: ADMIN_PASSWORD
         sync: false
@@ -30,6 +35,16 @@ services:
       # test payments, sk_live_... to take real money.
       - key: STRIPE_SECRET_KEY
         sync: false
+
+      # Ticket emails via Resend. The sending domain must be VERIFIED in Resend:
+      # phil-freeman.co.uk is verified; mayhembingo.co.uk is only a brand name, so we
+      # send from the verified domain but display 'Mayhem Bingo' as the sender name.
+      # Leave RESEND_API_KEY unset and tickets simply aren't emailed — buyers still
+      # see and can print them.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: MAIL_FROM
+        value: Mayhem Bingo <tickets@phil-freeman.co.uk>
 
       # Don't create the fake demo events (jazz brunch etc) on a real ticket site.
       - key: NO_SEED
