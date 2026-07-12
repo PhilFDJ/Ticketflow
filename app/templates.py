@@ -113,7 +113,7 @@ def layout(title, body, active="", admin=False, embed=False):
 {body}
 </div></main>
 <footer class="site"><div class="container">
-  Mayhem Bingo · tickets
+  Mayhem Bingo · tickets · <a href="/terms">Terms &amp; conditions</a>
 </div></footer>
 </body>
 </html>"""
@@ -195,7 +195,7 @@ def _maps_link(event):
 
 
 def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None,
-                 show_remaining=False, price_notice=None):
+                 show_remaining=False, price_notice=None, terms_required=False):
     fee_cfg = fee_cfg or {"percent": 0, "fixed": 0, "label": "Booking fee",
                           "enabled": False}
     d = fmt_date(event["starts_at"])
@@ -262,6 +262,13 @@ def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None,
             </div>
             <div>{control}</div>
           </div>""")
+    terms_box = ("" if not terms_required else """
+        <label class="termsbox mt3">
+          <input type="checkbox" name="accept_terms" value="1" id="acceptTerms" required>
+          <span>I have read and accept the
+            <a href="/terms" target="_blank" rel="noopener">terms &amp; conditions</a>.</span>
+        </label>""")
+
     err = flash("err", error) if error else ""
     if price_notice:
         lines = "".join(
@@ -300,6 +307,7 @@ def event_detail(event, ticket_types, live_mode, error=None, fee_cfg=None,
           <div class="feerow"><span class="muted">{esc(fee_cfg['label'])}</span>
             <span id="fee">{money(0, event['currency'])}</span></div>
         </div>
+        {terms_box}
         <div class="mt3" style="display:flex;align-items:center;justify-content:space-between">
           <div class="muted">Total <span id="total" style="color:var(--ink);font-size:20px;font-weight:700">{money(0, event['currency'])}</span></div>
           <button class="btn" id="checkoutbtn" type="submit" disabled>Checkout →</button>
@@ -980,6 +988,49 @@ def admin_discounts(discounts, events, error=None, fee_cfg=None, saved=False,
     """, admin=True)
 
 
+def terms_page(text):
+    return layout("Terms & conditions", f"""
+    <div class="narrow" style="margin:0 auto">
+      <h1>Terms &amp; conditions</h1>
+      <div class="termsbody mt2">{_nl2br(text)}</div>
+      <p class="mt3"><a href="/" class="muted">← Back to events</a></p>
+    </div>
+    """)
+
+
+def admin_terms(terms, saved=False):
+    has = bool(terms["text"])
+    return layout("Terms & conditions", f"""
+    <a href="/admin" class="muted small">← Dashboard</a>
+    <h1 class="mt2">Terms &amp; conditions</h1>
+    {flash("ok", "Terms saved. Buyers must now accept them at checkout.") if saved else ""}
+
+    <p class="lead">Write your terms here and buyers must tick to accept them before
+      paying. Leave it empty and no tickbox is shown.</p>
+
+    <div class="card mt2"><div class="body">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h2 class="mt0">Your terms
+          {'<span class="pill ok">Live</span>' if has else '<span class="pill">Not set</span>'}
+        </h2>
+        <span class="muted small">
+          {'Version ' + str(terms['version']) if has else 'No terms published'}</span>
+      </div>
+      <form method="post" action="/admin/terms">
+        <textarea name="terms_text" rows="18"
+          placeholder="e.g.&#10;&#10;Tickets are non-refundable unless the event is cancelled.&#10;&#10;Entry is subject to the venue's conditions. We reserve the right to refuse admission.&#10;&#10;Over 18s only. ID may be required.&#10;&#10;Please arrive by 7:30pm; latecomers may not be admitted.">{esc(terms['text'])}</textarea>
+        <p class="muted small mt1">Blank lines separate paragraphs. Every edit creates a
+          new version — orders record the version the customer accepted, so you can always
+          show what someone actually agreed to.</p>
+        <div class="mt3">
+          <button class="btn" type="submit">Save terms</button>
+          {'<a class="btn sec" href="/terms" target="_blank" style="margin-left:8px">View public page</a>' if has else ''}
+        </div>
+      </form>
+    </div></div>
+    """, admin=True)
+
+
 def admin_orders(orders, summary, status, search):
     rows = []
     for o in orders:
@@ -999,7 +1050,9 @@ def admin_orders(orders, summary, status, search):
             </div>
             <div class="muted small"><a href="tel:{phone}">{phone}</a></div>
           </td>
-          <td class="muted small">{esc(o['event_title'])}</td>
+          <td class="muted small">{esc(o['event_title'])}
+            {f'<br><span class="muted small">T&amp;Cs v{o["terms_version"]} accepted</span>'
+             if o.get("terms_accepted_at") else ''}</td>
           <td>{qty}</td>
           <td>{money(o['total'], o['currency'])}</td>
           <td>{badge}</td>
@@ -1206,6 +1259,7 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
       <a class="btn" href="/admin/orders">📋 All orders &amp; customers</a>
       <a class="btn sec" href="/admin/orders?status=pending">🛒 Abandoned carts</a>
       <a class="btn sec" href="/admin/discounts">🏷️ Discount codes</a>
+      <a class="btn sec" href="/admin/terms">📄 Terms &amp; conditions</a>
     </div>
 
     <div class="card mt3"><div class="body">

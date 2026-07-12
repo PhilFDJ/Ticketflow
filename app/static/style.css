@@ -265,3 +265,12 @@ tr.abandoned td:first-child{border-left:3px solid var(--warn,#f59e0b)}
 .tiernote{font-size:12px;color:var(--brand-2);margin-top:3px;font-weight:600}
 .lowstock{color:#f59e0b;font-weight:600}
 tr.tierrow td{border-bottom:1px dashed var(--line);background:rgba(255,255,255,.02)}
+
+/* Terms & conditions */
+.termsbox{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;
+  border:1px solid var(--line);border-radius:12px;background:var(--panel-2);
+  cursor:pointer;font-size:14px;line-height:1.5}
+.termsbox input{width:auto;flex:0 0 auto;margin-top:2px;transform:scale(1.2)}
+.termsbody{line-height:1.7;color:var(--ink)}
+.termsbody br+br{display:block;margin-top:10px;content:""}
+footer.site a{color:var(--muted);text-decoration:underline}

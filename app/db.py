@@ -137,6 +137,11 @@ def _migrate(conn):
         # Booking fee, charged per order to cover Stripe's cut. Shown separately
         # at checkout; `total` includes it.
         conn.execute("ALTER TABLE orders ADD COLUMN booking_fee INTEGER NOT NULL DEFAULT 0")
+    if "terms_accepted_at" not in ocols:
+        # Proof of acceptance. A tickbox is worthless if you can't later show WHAT
+        # they agreed to — terms change, so we stamp the version they saw.
+        conn.execute("ALTER TABLE orders ADD COLUMN terms_accepted_at INTEGER")
+        conn.execute("ALTER TABLE orders ADD COLUMN terms_version INTEGER NOT NULL DEFAULT 0")
 
     ecols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
     if "image" not in ecols:
@@ -293,7 +298,7 @@ class PriceChanged(Exception):
 
 def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
                  currency="GBP", buyer_phone="", discount_code="",
-                 quoted_prices=None):
+                 quoted_prices=None, accept_terms=False):
     """items: list of (ticket_type_id, qty). Validates stock. Returns order id.
 
     Raises ValueError if a ticket type is sold out / lacks stock, or if a supplied
@@ -351,15 +356,24 @@ def create_order(event_id, buyer_name, buyer_email, items, provider="mock",
     fee = calc_booking_fee(after_discount)
     total = after_discount + fee
 
+    # Terms: refuse the order if terms exist and weren't accepted. Enforced on the
+    # SERVER — a required checkbox in HTML is trivially bypassed.
+    terms = get_terms()
+    if terms["text"] and not accept_terms:
+        raise ValueError("Please accept the terms and conditions.")
+    accepted_at = now() if terms["text"] else None
+
     with cursor() as conn:
         conn.execute(
             "INSERT INTO orders (id,event_id,buyer_name,buyer_email,buyer_phone,"
             "total,subtotal,discount_id,discount_code,discount_amount,booking_fee,"
+            "terms_accepted_at,terms_version,"
             "currency,status,provider,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (oid, event_id, buyer_name, buyer_email, buyer_phone or "", total,
              subtotal, disc["id"] if disc else None,
              disc["code"] if disc else "", off, fee,
+             accepted_at, terms["version"],
              currency, "pending", provider, now()),
         )
         for tt_id, qty, price in resolved:
@@ -536,6 +550,7 @@ def all_orders(status=None, search="", limit=500):
     sql = (
         "SELECT o.id, o.buyer_name, o.buyer_email, o.buyer_phone, o.total, "
         "o.currency, o.status, o.created_at, o.provider, "
+        "o.terms_accepted_at, o.terms_version, "
         "e.id AS event_id, e.title AS event_title, e.starts_at, "
         "(SELECT COUNT(*) FROM tickets t WHERE t.order_id = o.id) AS ticket_count, "
         "(SELECT SUM(oi.qty) FROM order_items oi WHERE oi.order_id = o.id) AS item_qty "
@@ -703,7 +718,49 @@ DEFAULT_SETTINGS = {
     "fee_percent": "0",     # e.g. "5" for 5%
     "fee_fixed": "0",       # pence, e.g. "20" for 20p
     "fee_label": "Booking fee",
+    "terms_text": "",
+    "terms_version": "0",
 }
+
+
+def get_terms():
+    """The current terms, and which version they are.
+
+    Version bumps on every edit. Orders record the version they accepted, so if
+    you change the terms later you can still show exactly what a given customer
+    agreed to — which is the whole point of the tickbox.
+    """
+    return {
+        "text": get_setting("terms_text") or "",
+        "version": int(get_setting("terms_version") or 0),
+    }
+
+
+def save_terms(text):
+    text = (text or "").strip()
+    cur = get_terms()
+    if text == cur["text"]:
+        return cur["version"]          # nothing changed, don't bump
+    v = cur["version"] + 1
+    set_setting("terms_text", text)
+    set_setting("terms_version", v)
+    # Keep the old wording, so a past order's version can still be displayed.
+    if cur["text"]:
+        set_setting(f"terms_text_v{cur['version']}", cur["text"])
+    return v
+
+
+def terms_version_text(version):
+    """The wording of a specific past version (for proving what someone accepted)."""
+    cur = get_terms()
+    if version == cur["version"]:
+        return cur["text"]
+    return get_setting(f"terms_text_v{version}", "") or ""
+
+
+def terms_required():
+    """Only force acceptance if you've actually written some terms."""
+    return bool(get_terms()["text"])
 
 
 def get_setting(key, default=None):

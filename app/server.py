@@ -373,7 +373,8 @@ def event_detail(h, eid):
     err = "Payment cancelled — your tickets weren't purchased." if h.query.get("cancelled") else None
     h.send_html(T.event_detail(event, tts, payments.is_live(), error=err,
                                fee_cfg=db.fee_config(),
-                               show_remaining=db.get_setting("show_remaining") == "1"))
+                               show_remaining=db.get_setting("show_remaining") == "1",
+                               terms_required=db.terms_required()))
 
 
 @route("POST", "/checkout")
@@ -396,16 +397,19 @@ def checkout(h):
     # What the page QUOTED them. If a tier has moved on since, we refuse rather
     # than silently charging more (see db.PriceChanged).
     quoted = {k[len("quoted_"):]: v for k, v in flat.items() if k.startswith("quoted_")}
+    accepted = flat.get("accept_terms") in ("1", "on", "true", "yes")
     if not items or not name or not email or not phone:
         return h.send_html(T.event_detail(event, _priced(tts), payments.is_live(),
             error="Please pick at least one ticket and enter your name, email and phone.",
             fee_cfg=db.fee_config(),
-            show_remaining=db.get_setting("show_remaining") == "1"), 400)
+            show_remaining=db.get_setting("show_remaining") == "1",
+            terms_required=db.terms_required()), 400)
     try:
         oid = db.create_order(eid, name, email, items,
                               provider=("stripe" if payments.is_live() else "mock"),
                               currency=event["currency"], buyer_phone=phone,
-                              discount_code=dcode, quoted_prices=quoted)
+                              discount_code=dcode, quoted_prices=quoted,
+                              accept_terms=accepted)
     except db.PriceChanged as pc:
         # Show them the new price and let them decide. Never charge a price they
         # weren't shown.
@@ -413,12 +417,14 @@ def checkout(h):
                                           payments.is_live(),
                                           fee_cfg=db.fee_config(),
                                           show_remaining=db.get_setting("show_remaining") == "1",
+                                          terms_required=db.terms_required(),
                                           price_notice=pc.changes), 409)
     except ValueError as e:
         return h.send_html(T.event_detail(event, _priced(db.list_ticket_types(eid)),
                                           payments.is_live(),
                                           error=str(e), fee_cfg=db.fee_config(),
-                                          show_remaining=db.get_setting("show_remaining") == "1"), 400)
+                                          show_remaining=db.get_setting("show_remaining") == "1",
+                                          terms_required=db.terms_required()), 400)
 
     order = db.get_order(oid)
     line_items = [{"name": db.get_ticket_type(tt)["name"], "qty": q,
@@ -639,6 +645,35 @@ def admin_test_email(h):
     })
 
 
+@route("GET", "/terms")
+def terms_page(h):
+    """Public terms & conditions."""
+    t = db.get_terms()
+    if not t["text"]:
+        return h.send_html(T.layout("Terms",
+            '<div class="narrow" style="margin:0 auto">'
+            '<h1>Terms &amp; conditions</h1>'
+            '<p class="muted">No terms have been published yet.</p></div>'), 404)
+    h.send_html(T.terms_page(t["text"]))
+
+
+@route("GET", "/admin/terms")
+def admin_terms(h):
+    if not require_admin(h):
+        return
+    h.send_html(T.admin_terms(db.get_terms(),
+                              saved=(h.query.get("saved") == "1")))
+
+
+@route("POST", "/admin/terms")
+def admin_terms_save(h):
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    db.save_terms(flat.get("terms_text", ""))
+    h.redirect("/admin/terms?saved=1")
+
+
 @route("POST", "/admin/tiers/add")
 def admin_tier_add(h):
     if not require_admin(h):
@@ -810,7 +845,7 @@ def admin_orders_csv(h):
     buf = _io.StringIO()
     w = csv.writer(buf)
     w.writerow(["Date", "Event", "Name", "Email", "Phone", "Tickets",
-                "Total", "Status"])
+                "Total", "Status", "T&Cs accepted"])
     for o in db.all_orders(status=status or None, search="", limit=5000):
         w.writerow([
             time.strftime("%d/%m/%Y %H:%M", time.localtime(int(o["created_at"]))),
@@ -819,6 +854,9 @@ def admin_orders_csv(h):
             o["ticket_count"] or o["item_qty"] or 0,
             f"{o['total']/100:.2f}",
             "PAID" if o["status"] == "paid" else "ABANDONED",
+            (time.strftime("%d/%m/%Y %H:%M",
+                           time.localtime(int(o["terms_accepted_at"])))
+             + f" (v{o['terms_version']})") if o.get("terms_accepted_at") else "",
         ])
     data = buf.getvalue().encode("utf-8-sig")
     h.send_response(200)
