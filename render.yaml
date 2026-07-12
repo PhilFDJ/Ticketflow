@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: ticketflow
+    runtime: python
+    plan: starter
+    branch: main
+    # No dependencies to install — TicketFlow is stdlib-only.
+    buildCommand: "true"
+    startCommand: "python3 run.py"
+
+    # CRITICAL: Render's normal filesystem is wiped on every deploy. TicketFlow
+    # keeps everything (events, orders, tickets) in one SQLite file, so without a
+    # persistent disk every ticket you had sold would vanish on the next deploy.
+    # This disk survives deploys and restarts.
+    disk:
+      name: ticketflow-data
+      mountPath: /var/data
+      sizeGB: 1
+
+    envVars:
+      # Store the SQLite DB on the persistent disk, NOT in the app directory.
+      - key: TICKETFLOW_DB
+        value: /var/data/ticketflow.db
+
+      # Organiser dashboard password. Set a real one in the Render dashboard.
+      - key: ADMIN_PASSWORD
+        sync: false
+
+      # Stripe secret key. Leave unset for mock mode; set sk_test_... to take
+      # test payments, sk_live_... to take real money.
+      - key: STRIPE_SECRET_KEY
+        sync: false
+
+      # Don't create the fake demo events (jazz brunch etc) on a real ticket site.
+      - key: NO_SEED
+        value: "1"
+
+      - key: PYTHON_VERSION
+        value: "3.11.9"
