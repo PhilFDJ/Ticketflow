@@ -216,6 +216,8 @@ def ticket_email_html(event, tickets, base_url, qr_svgs=None):
     <p style="font-size:12px;color:#5a6b7b;margin-top:20px">
       Keep this email safe — it's your ticket. If the QR won't scan on the night,
       the ticket code above can be entered by hand at the door.
+      <br><br>Lost this email? You can have it sent again at
+      <a href="{_e(base_url)}/resend" style="color:#6366f1">{_e(base_url)}/resend</a>
     </p>
   </div>
 </body></html>"""

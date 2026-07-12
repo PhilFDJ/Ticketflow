@@ -113,7 +113,8 @@ def layout(title, body, active="", admin=False, embed=False):
 {body}
 </div></main>
 <footer class="site"><div class="container">
-  Mayhem Bingo · tickets · <a href="/terms">Terms &amp; conditions</a>
+  Mayhem Bingo · tickets · <a href="/resend">Lost your tickets?</a>
+  · <a href="/terms">Terms &amp; conditions</a>
 </div></footer>
 </body>
 </html>"""
@@ -743,12 +744,14 @@ def admin_door(event, parties):
                    f'Admit {remaining}</button>')
 
         rows.append(f"""
-        <div class="party {state}" data-state="{state}" data-name="{esc((p['buyer_name'] or '').lower())}">
+        <div class="party {state}" data-state="{state}" data-oid="{esc(p['order_id'])}"
+             data-name="{esc((p['buyer_name'] or '').lower())}">
           <div>
-            <div class="who">{esc(p['buyer_name'] or 'Unknown')} {badge}</div>
+            <div class="who">{esc(p['buyer_name'] or 'Unknown')}
+              <span class="badgeslot">{badge}</span></div>
             <div class="meta">{kind_str}</div>
           </div>
-          {act}
+          <span class="actslot">{act}</span>
         </div>""")
 
     body = f"""
@@ -757,10 +760,15 @@ def admin_door(event, parties):
     <p class="lead">{esc(event['title'])} · {esc(fmt_date(event['starts_at']))}</p>
 
     <div class="grid cols-3 mt2">
-      <div class="stat"><div class="n">{total_in}</div><div class="l">Checked in</div></div>
-      <div class="stat"><div class="n">{to_come}</div><div class="l">Still to come</div></div>
-      <div class="stat"><div class="n">{total_tickets}</div><div class="l">Tickets sold</div></div>
+      <div class="stat"><div class="n" id="statIn">{total_in}</div>
+        <div class="l">Checked in</div></div>
+      <div class="stat"><div class="n" id="statToCome">{to_come}</div>
+        <div class="l">Still to come</div></div>
+      <div class="stat"><div class="n" id="statTotal">{total_tickets}</div>
+        <div class="l">Tickets sold</div></div>
     </div>
+    <p class="muted small mt1" id="liveDot">● Live — updates on its own as people
+      are scanned in.</p>
 
     <div class="att-tabs mt3">
       <button class="on" data-f="all"     onclick="doorFilter(this,'all')">Everyone</button>
@@ -806,6 +814,63 @@ def admin_door(event, parties):
         el.style.display = (okF && okQ) ? '' : 'none';
       }});
     }}
+    // ---- LIVE UPDATES -------------------------------------------------
+    // Poll the door state and patch rows IN PLACE. Deliberately not a page
+    // reload: that would wipe the search box, lose your scroll position, and
+    // fight you every time you touched the screen.
+    let doorPollTimer = null;
+
+    function paintParty(el, p){{
+      const state = p.state;
+      if (el.dataset.state === state && el.dataset.in === String(p.in)) return;
+      el.dataset.state = state;
+      el.dataset.in = String(p.in);
+      el.className = 'party ' + state;
+
+      const badge = el.querySelector('.badgeslot');
+      if (badge) {{
+        badge.innerHTML =
+          state === 'in'      ? '<span class="pill ok">In</span>'
+        : state === 'partial' ? '<span class="pill warn">' + p.in + ' of ' + p.of + ' in</span>'
+        : '';
+      }}
+      const act = el.querySelector('.actslot');
+      if (act) {{
+        const left = p.of - p.in;
+        act.innerHTML = left > 0
+          ? '<button class="btn sm act" onclick="doorAdmit(\\'' + p.id + '\\', this)">Admit ' + left + '</button>'
+          : '';
+      }}
+      doorApply();   // re-apply the filter, or an admitted party lingers under "Still to come"
+    }}
+
+    async function doorPoll(){{
+      // Don't burn battery polling a screen nobody's looking at.
+      if (document.hidden) return;
+      try {{
+        const r = await fetch('/api/door/{esc(event["id"])}', {{cache: 'no-store'}});
+        if (!r.ok) return;
+        const j = await r.json();
+        document.getElementById('statIn').textContent = j.in;
+        document.getElementById('statToCome').textContent = j.to_come;
+        document.getElementById('statTotal').textContent = j.total;
+        j.parties.forEach(p => {{
+          const el = document.querySelector('.party[data-oid="' + p.id + '"]');
+          if (el) paintParty(el, p);
+        }});
+        const dot = document.getElementById('liveDot');
+        if (dot) dot.classList.remove('stale');
+      }} catch (e) {{
+        const dot = document.getElementById('liveDot');
+        if (dot) dot.classList.add('stale');   // wifi wobbled; keep trying
+      }}
+    }}
+
+    doorPollTimer = setInterval(doorPoll, 4000);
+    document.addEventListener('visibilitychange', () => {{
+      if (!document.hidden) doorPoll();   // catch up the moment you look at it
+    }});
+
     async function doorAdmit(orderId, btn){{
       btn.disabled = true; btn.textContent = 'Admitting…';
       try{{
@@ -1032,6 +1097,190 @@ def admin_archive(events, stats_by_event):
     <p class="muted small mt3">Archiving only hides an event. Its tickets stay valid and
       scannable, the door list still works, and the orders and revenue are all still
       counted. Restore it any time.</p>
+    """, admin=True)
+
+
+def admin_sales(rows, summary, best, events, selected, days, cap=None):
+    peak = max((r["tickets"] for r in rows), default=0) or 1
+    n = len(rows)
+
+    # Hand-rolled SVG bar chart. No JS library, no CDN — it renders even if the
+    # venue wifi is dreadful.
+    W, H, PAD = 920, 200, 8
+    bw = max(2, (W - PAD * (n - 1)) / n) if n else 10
+    bars, labels = [], []
+    for i, r in enumerate(rows):
+        x = i * (bw + PAD)
+        bh = (r["tickets"] / peak) * (H - 26)
+        y = H - bh - 18
+        tip = (f"{time.strftime('%a %d %b', time.strptime(r['day'], '%Y-%m-%d'))}: "
+               f"{r['tickets']} ticket{'s' if r['tickets'] != 1 else ''}"
+               f" · {money(r['revenue'])}")
+        cls = "bar peak" if r["tickets"] == peak and peak > 0 else "bar"
+        bars.append(
+            f'<rect class="{cls}" x="{x:.1f}" y="{y:.1f}" width="{bw:.1f}" '
+            f'height="{max(bh, 1):.1f}" rx="2"><title>{esc(tip)}</title></rect>')
+        # Only label every few bars, or they collide.
+        if n <= 14 or i % max(1, n // 10) == 0:
+            d = time.strptime(r["day"], "%Y-%m-%d")
+            labels.append(
+                f'<text class="xlab" x="{x + bw/2:.1f}" y="{H - 4}" '
+                f'text-anchor="middle">{time.strftime("%d/%m", d)}</text>')
+
+    chart = (f'<svg viewBox="0 0 {W} {H}" class="saleschart" '
+             f'preserveAspectRatio="none">{"".join(bars)}{"".join(labels)}</svg>')
+
+    opts = "".join(
+        f'<option value="{esc(e["id"])}"{" selected" if selected == e["id"] else ""}>'
+        f'{esc(e["title"])}</option>' for e in events)
+
+    best_line = ""
+    if best:
+        d = time.strptime(best["day"], "%Y-%m-%d")
+        best_line = (f'<p class="muted small mt2">Busiest day: '
+                     f'<b>{time.strftime("%a %d %b", d)}</b> — {best["tickets"]} tickets, '
+                     f'{money(best["revenue"])}. What did you do that day?</p>')
+
+    cap_card = ""
+    if cap and cap["capacity"]:
+        pct = cap["percent"]
+        bar_col = "#22c55e" if pct >= 90 else "#6366f1"
+        cap_card = f"""
+        <div class="card mt3"><div class="body">
+          <div class="row" style="justify-content:space-between;align-items:baseline">
+            <h2 class="mt0">{pct}% sold</h2>
+            <span class="muted small">{cap['sold']} of {cap['capacity']}
+              · {cap['remaining']} left</span>
+          </div>
+          <div class="capbar mt2">
+            <div class="capfill" style="width:{min(100, pct)}%;background:{bar_col}"></div>
+          </div>
+        </div></div>"""
+
+    net = summary["revenue"] - summary["fees"]
+
+    return layout("Sales", f"""
+    <a href="/admin" class="muted small">← Dashboard</a>
+    <h1 class="mt2">Sales</h1>
+    <p class="lead">When tickets actually sold — so you can see what worked.</p>
+
+    <form method="get" action="/admin/sales" class="row mt3" style="gap:8px">
+      <div><select name="event" onchange="this.form.submit()">
+        <option value="">All events</option>
+        {opts}
+      </select></div>
+      <div><select name="days" onchange="this.form.submit()">
+        <option value="7"{' selected' if days == 7 else ''}>Last 7 days</option>
+        <option value="30"{' selected' if days == 30 else ''}>Last 30 days</option>
+        <option value="90"{' selected' if days == 90 else ''}>Last 90 days</option>
+      </select></div>
+    </form>
+
+    <div class="grid cols-3 mt3">
+      <div class="stat"><div class="n">{summary['tickets']}</div>
+        <div class="l">Tickets sold</div></div>
+      <div class="stat"><div class="n">{money(summary['revenue'])}</div>
+        <div class="l">Taken from customers</div></div>
+      <div class="stat"><div class="n">{money(net)}</div>
+        <div class="l">Ticket revenue (minus {money(summary['fees'])} booking fees)</div></div>
+    </div>
+
+    {cap_card}
+
+    <div class="card mt3"><div class="body">
+      <h2 class="mt0">Tickets sold per day</h2>
+      {chart if any(r['tickets'] for r in rows)
+       else '<p class="muted">No sales in this period.</p>'}
+      {best_line}
+      <p class="muted small mt2">Hover a bar for the exact numbers. A spike usually
+        means a post, a share or a shout-out landed — worth knowing which.</p>
+    </div></div>
+
+    {f'<p class="muted small mt2">Discounts given: {money(summary["discounts"])}</p>'
+     if summary['discounts'] else ''}
+    """, admin=True)
+
+
+def resend_page(sent=None, error=None):
+    body = (f'<div class="flash ok">{esc(sent)}</div>' if sent else f"""
+      <form method="post" action="/resend" class="mt3">
+        <label>The email you booked with</label>
+        <input name="email" type="email" required autofocus placeholder="alex@email.com">
+        <button class="btn full mt3" type="submit">Email my tickets</button>
+      </form>""")
+
+    return layout("Resend my tickets", f"""
+    <div class="narrow" style="margin:30px auto 0">
+      <div class="card"><div class="body">
+        <h1 class="mt0">Lost your tickets?</h1>
+        <p class="muted">Enter the email address you used to book and we'll send
+          them again.</p>
+        {flash("err", error) if error else ""}
+        {body}
+      </div></div>
+      <p class="center mt3"><a href="/" class="muted">← Back to events</a></p>
+    </div>
+    """)
+
+
+def admin_lookup(query, results, msg=None, err=None):
+    rows = []
+    for o in results:
+        when = time.strftime("%d %b %Y", time.localtime(int(o["created_at"])))
+        rows.append(f"""
+        <div class="card mt2"><div class="body">
+          <div class="row" style="justify-content:space-between;align-items:flex-start;gap:12px">
+            <div>
+              <div style="font-weight:700;font-size:16px">{esc(o['buyer_name'])}</div>
+              <div class="muted small">{esc(o['event_title'])} · {o['ticket_count']} ticket(s)
+                · {money(o['total'], o['currency'])} · booked {when}</div>
+              <div class="muted small mt1">
+                📧 {esc(o['buyer_email'])} &nbsp; 📞 {esc(o['buyer_phone'] or '—')}</div>
+            </div>
+            <form method="post" action="/admin/resend" style="margin:0;flex:0 0 auto">
+              <input type="hidden" name="id" value="{esc(o['id'])}">
+              <input type="hidden" name="back"
+                     value="/admin/lookup?q={esc(urllib.parse.quote(query))}">
+              <button class="btn sm" type="submit">Resend tickets</button>
+            </form>
+          </div>
+
+          <details class="mt2">
+            <summary class="muted small" style="cursor:pointer">
+              Wrong email address? Send to a different one</summary>
+            <form method="post" action="/admin/resend" class="row mt2" style="gap:8px">
+              <input type="hidden" name="id" value="{esc(o['id'])}">
+              <input type="hidden" name="back"
+                     value="/admin/lookup?q={esc(urllib.parse.quote(query))}">
+              <div><input name="to" type="email" required
+                          placeholder="their correct address"></div>
+              <div style="flex:0 0 auto">
+                <button class="btn sec sm" type="submit">Send &amp; fix</button></div>
+            </form>
+            <p class="muted small mt1">This also corrects the address on their order,
+              so any future email reaches them.</p>
+          </details>
+        </div></div>""")
+
+    return layout("Find a customer", f"""
+    <a href="/admin" class="muted small">← Dashboard</a>
+    <h1 class="mt2">Find a customer</h1>
+    <p class="lead">Look someone up and resend their tickets — by name, email or phone.</p>
+    {flash("ok", msg) if msg else ""}
+    {flash("err", err) if err else ""}
+
+    <form method="get" action="/admin/lookup" class="row mt3" style="gap:8px">
+      <input name="q" value="{esc(query)}" autofocus
+             placeholder="Sharon, sharon@… or 07700…">
+      <button class="btn" style="flex:0 0 auto" type="submit">Search</button>
+    </form>
+
+    {''.join(rows) if rows else
+     (f'<p class="muted mt3">No paid orders match “{esc(query)}”.</p>' if query
+      else '<p class="muted mt3">Search for a customer above.</p>')}
+
+    <p class="muted small mt3">Customers can also resend tickets themselves at
+      <a href="/resend">/resend</a> — worth pointing them there before the night.</p>
     """, admin=True)
 
 
@@ -1338,6 +1587,8 @@ def admin_dashboard(events, stats_by_event, live_mode, mail_on=False, mail_from=
       <a class="btn sec" href="/admin/archive">🗄️ Archive{f' ({archived_count})' if archived_count else ''}</a>
       <a class="btn sec" href="/admin/orders?status=pending">🛒 Abandoned carts</a>
       <a class="btn sec" href="/admin/discounts">🏷️ Discount codes</a>
+      <a class="btn sec" href="/admin/sales">📈 Sales</a>
+      <a class="btn sec" href="/admin/lookup">🔎 Find a customer</a>
       <a class="btn sec" href="/admin/terms">📄 Terms &amp; conditions</a>
       <a class="btn sec" href="/admin/backup"
          title="Download the whole database. Keep it somewhere that isn't Render.">⤓ Backup database</a>

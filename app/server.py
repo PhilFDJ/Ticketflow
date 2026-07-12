@@ -523,6 +523,197 @@ def public_base_url():
         or "https://tickets.mayhembingo.co.uk"
 
 
+def check_capacity_alert(eid, base_url=None):
+    """Email Phil when an event crosses 75% / 90% / 100% sold.
+
+    Fires after a payment, so it reflects tickets actually paid for. Each threshold
+    fires exactly once (see claim_capacity_alert) — otherwise every sale past 75%
+    would send another email.
+    """
+    if not mailer.is_configured():
+        return
+    alert_to = os.environ.get("ALERT_EMAIL", "").strip() or mailer.reply_to()
+    if not alert_to:
+        return
+
+    cap = db.capacity_state(eid)
+    if not cap["capacity"]:
+        return
+
+    # Highest threshold crossed, so a big group booking that jumps 70% -> 95%
+    # sends the 90% alert, not the 75% one.
+    hit = None
+    for t in (100, 90, 75):
+        if cap["percent"] >= t:
+            hit = t
+            break
+    if hit is None:
+        return
+    if not db.claim_capacity_alert(eid, hit):
+        return          # already told you
+
+    event = db.get_event(eid)
+    when = time.strftime("%a %d %b, %H:%M", time.localtime(int(event["starts_at"])))
+    base = base_url or public_base_url()
+
+    if hit >= 100:
+        subject = f"SOLD OUT — {event['title']}"
+        headline = "That's a sell-out."
+        line = f"All {cap['sold']} tickets are gone."
+    else:
+        subject = f"{cap['percent']}% sold — {event['title']}"
+        headline = f"{event['title']} is {cap['percent']}% sold."
+        line = (f"{cap['sold']} of {cap['capacity']} tickets gone — "
+                f"only {cap['remaining']} left.")
+
+    html = f"""
+    <div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:520px">
+      <h2 style="margin:0 0 6px">{mailer._e(headline)}</h2>
+      <p style="color:#5a6b7b;margin:0 0 16px">{mailer._e(when)}</p>
+      <p style="font-size:16px"><b>{mailer._e(line)}</b></p>
+      <p style="margin-top:20px">
+        <a href="{mailer._e(base)}/admin/events/{mailer._e(eid)}"
+           style="background:#6366f1;color:#fff;padding:10px 18px;border-radius:8px;
+                  text-decoration:none">Open the event</a>
+      </p>
+      <p style="font-size:12px;color:#8b9bab;margin-top:18px">
+        {"Add more tickets if the venue can take them, or stop promoting."
+         if hit < 100 else "Nothing left to sell. Time to stop the ads."}
+      </p>
+    </div>"""
+    text = f"{headline}\n{when}\n\n{line}\n\n{base}/admin/events/{eid}\n"
+
+    ok, err = mailer.send_verbose(alert_to, subject, html, text)
+    if not ok:
+        print(f"[capacity] alert failed: {err}")
+    else:
+        print(f"[capacity] alerted at {hit}% for {eid}")
+
+
+def resend_ticket_email(oid, to_email=None, base_url=None):
+    """Deliberately re-send an order's tickets.
+
+    Separate from send_ticket_email() because that one is guarded to fire exactly
+    ONCE per order (so a refreshed success page can't spam the buyer). A resend is
+    an explicit human decision, so it bypasses that guard — but it does NOT touch
+    emailed_at, so the automatic-send logic stays intact.
+
+    to_email lets an admin correct a typo'd address. It defaults to the address on
+    the order — which is what the PUBLIC page always uses, so nobody can redirect
+    someone else's tickets to themselves.
+    """
+    order = db.get_order(oid)
+    if not order or order["status"] != "paid":
+        return False, "That order isn't a completed purchase."
+    if not mailer.is_configured():
+        return False, "Email isn't set up on this site."
+
+    event = db.get_event(order["event_id"])
+    tickets = db.tickets_for_order(oid)
+    if not tickets:
+        return False, "That order has no tickets."
+
+    dest = (to_email or order["buyer_email"] or "").strip()
+    if not dest:
+        return False, "No email address to send to."
+
+    base = base_url or public_base_url()
+    ok, err = mailer.send_verbose(
+        dest,
+        f"Your tickets — {event['title']}",
+        mailer.ticket_email_html(event, tickets, base),
+        mailer.ticket_email_text(event, tickets, base),
+    )
+    if not ok:
+        return False, err or "The email provider rejected it."
+    return True, f"Sent {len(tickets)} ticket(s) to {dest}."
+
+
+# Simple in-memory rate limit for the public resend page. Without it, this is a
+# button that spams a stranger's inbox. Resets on restart, which is fine — it only
+# needs to stop casual abuse.
+_resend_hits = {}
+
+
+def _resend_allowed(key, limit=3, window=600):
+    t = time.time()
+    hits = [h for h in _resend_hits.get(key, []) if t - h < window]
+    if len(hits) >= limit:
+        _resend_hits[key] = hits
+        return False
+    hits.append(t)
+    _resend_hits[key] = hits
+    return True
+
+
+@route("GET", "/resend")
+def resend_page(h):
+    """Public: 'I've lost my tickets, email them to me again.'"""
+    h.send_html(T.resend_page())
+
+
+@route("POST", "/resend")
+def resend_post(h):
+    flat, _ = h.form()
+    email = (flat.get("email") or "").strip()
+
+    # ALWAYS give the same answer, whether or not that address has tickets.
+    # Otherwise this page becomes a way to find out who bought tickets.
+    done = ("If that address has tickets, we've just emailed them. "
+            "Check your spam folder if they don't appear in a minute.")
+
+    if not email or "@" not in email:
+        return h.send_html(T.resend_page(error="Enter a valid email address."), 400)
+
+    # Rate limit per address AND per IP.
+    ip = h.client_address[0] if h.client_address else "?"
+    if not _resend_allowed(f"e:{email.lower()}") or not _resend_allowed(f"i:{ip}", limit=10):
+        # Same friendly message — don't reveal that a limit was hit either.
+        return h.send_html(T.resend_page(sent=done))
+
+    orders = db.paid_orders_for_email(email)
+    for o in orders[:5]:          # cap it: one person, one on-sale, not 50 emails
+        # NB: always sends to the address ON THE ORDER, never to a supplied one.
+        ok, msg = resend_ticket_email(o["id"], base_url=h.base_url())
+        if not ok:
+            print(f"[resend] failed for {o['id']}: {msg}")
+
+    h.send_html(T.resend_page(sent=done))
+
+
+@route("POST", "/admin/resend")
+def admin_resend(h):
+    """Admin: resend an order's tickets, optionally to a CORRECTED address.
+
+    This is the one that rescues a mistyped email — the public page can't help
+    someone whose address was wrong in the first place.
+    """
+    if not require_admin(h):
+        return
+    flat, _ = h.form()
+    oid = flat.get("id", "")
+    to = (flat.get("to") or "").strip() or None
+    back = flat.get("back") or "/admin/lookup"
+
+    ok, msg = resend_ticket_email(oid, to_email=to, base_url=h.base_url())
+    if to and ok:
+        db.update_order_email(oid, to)   # remember the fix for next time
+    key = "msg" if ok else "err"
+    sep = "&" if "?" in back else "?"
+    h.redirect(f"{back}{sep}{key}={urllib.parse.quote(msg)}")
+
+
+@route("GET", "/admin/lookup")
+def admin_lookup(h):
+    """Find a customer's order and resend their tickets."""
+    if not require_admin(h):
+        return
+    q = (h.query.get("q") or "").strip()
+    results = db.find_orders(q) if q else []
+    h.send_html(T.admin_lookup(q, results,
+                               msg=h.query.get("msg"), err=h.query.get("err")))
+
+
 @route("POST", "/webhooks/stripe")
 def stripe_webhook(h):
     """Stripe tells us directly when a payment succeeds.
@@ -608,6 +799,12 @@ def _fulfil_order(oid, source="webhook"):
     except Exception as e:
         print(f"[{source}] ticket email failed for {oid}: {e}")
 
+    # Tell Phil if the event is filling up. Never let this break fulfilment either.
+    try:
+        check_capacity_alert(order["event_id"])
+    except Exception as e:
+        print(f"[{source}] capacity alert failed: {e}")
+
 
 def _void_refunded(charge):
     """Void the tickets on a refunded order, so a refunded customer can't get in."""
@@ -651,6 +848,10 @@ def success(h):
     # may already have done this; send_ticket_email() handles that safely.
     send_ticket_email(oid, h.base_url())
     emailed = bool(db.get_order(oid).get("emailed_at"))
+    try:
+        check_capacity_alert(order["event_id"], h.base_url())
+    except Exception as e:
+        print(f"[capacity] {e}")
 
     h.send_html(T.success(order, event, tickets, svgs,
                           emailed=emailed, email_on=mailer.is_configured()))
@@ -1178,6 +1379,56 @@ def admin_event_csv(h, eid):
     h.send_header("Content-Length", str(len(data)))
     h.end_headers()
     h.wfile.write(data)
+
+
+@route("GET", "/admin/sales")
+def admin_sales(h):
+    """When did tickets actually sell? Shows which promo moved the needle."""
+    if not require_admin(h):
+        return
+    eid = h.query.get("event", "") or None
+    try:
+        days = max(7, min(90, int(h.query.get("days", "30"))))
+    except ValueError:
+        days = 30
+
+    h.send_html(T.admin_sales(
+        rows=db.sales_over_time(eid, days),
+        summary=db.sales_summary(eid),
+        best=db.busiest_day(eid, days),
+        events=db.list_events(archived=None),
+        selected=eid or "",
+        days=days,
+        cap=db.capacity_state(eid) if eid else None,
+    ))
+
+
+@route("GET", r"/api/door/(?P<eid>[\w]+)")
+def api_door_state(h, eid):
+    """Current door state, for the live-updating list.
+
+    Deliberately small: the page polls this every few seconds, so it returns just
+    what changed — counts and each party's admitted state — not the whole page.
+    """
+    if not h.is_admin():
+        return h.send_json({"error": "unauthorised"}, 401)
+    event = db.get_event(eid)
+    if not event:
+        return h.send_json({"error": "unknown event"}, 404)
+
+    parties = db.event_attendance(eid)
+    total = sum(p["total"] for p in parties)
+    inside = sum(p["in_count"] for p in parties)
+    return h.send_json({
+        "in": inside,
+        "to_come": total - inside,
+        "total": total,
+        "parties": [
+            {"id": p["order_id"], "in": p["in_count"],
+             "of": p["total"], "state": p["state"]}
+            for p in parties
+        ],
+    })
 
 
 @route("GET", r"/admin/events/(?P<eid>[\w]+)/door")

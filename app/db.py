@@ -984,6 +984,149 @@ def set_payment_intent(oid, pi):
         conn.execute("UPDATE orders SET payment_intent = ? WHERE id = ?", (pi, oid))
 
 
+def update_order_email(oid, email):
+    """Correct a mistyped address, so any future email reaches them."""
+    with cursor() as conn:
+        conn.execute("UPDATE orders SET buyer_email = ? WHERE id = ?",
+                     ((email or "").strip(), oid))
+
+
+def paid_orders_for_email(email):
+    """Every paid, non-refunded order for an email address, newest first.
+
+    Used by the public 'resend my tickets' page. Only PAID orders — an abandoned
+    cart has no tickets to send.
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        return []
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT o.*, e.title AS event_title, e.starts_at "
+            "FROM orders o JOIN events e ON e.id = o.event_id "
+            "WHERE LOWER(o.buyer_email) = ? AND o.status = 'paid' "
+            "ORDER BY o.created_at DESC", (email,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def find_orders(query):
+    """Admin lookup: find an order by name, email or phone.
+
+    Deliberately broader than the public one — the whole point is to rescue someone
+    who mistyped their email, so searching by their email alone wouldn't find them.
+    """
+    q = f"%{(query or '').strip().lower()}%"
+    if not query.strip():
+        return []
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT o.*, e.title AS event_title, e.starts_at, "
+            "(SELECT COUNT(*) FROM tickets t WHERE t.order_id = o.id) AS ticket_count "
+            "FROM orders o JOIN events e ON e.id = o.event_id "
+            "WHERE o.status = 'paid' AND ("
+            "  LOWER(o.buyer_name) LIKE ? OR LOWER(o.buyer_email) LIKE ? "
+            "  OR REPLACE(o.buyer_phone,' ','') LIKE ?) "
+            "ORDER BY o.created_at DESC LIMIT 50",
+            (q, q, q.replace(" ", ""))).fetchall()
+    return [dict(r) for r in rows]
+
+
+def capacity_state(eid):
+    """How full is this event? Used for the sold-out alerts."""
+    with cursor() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(quantity),0) cap, COALESCE(SUM(sold),0) sold "
+            "FROM ticket_types WHERE event_id = ?", (eid,)).fetchone()
+    cap = row["cap"] or 0
+    sold = row["sold"] or 0
+    pct = int(round(sold * 100 / cap)) if cap else 0
+    return {"capacity": cap, "sold": sold, "percent": pct,
+            "remaining": max(0, cap - sold)}
+
+
+def claim_capacity_alert(eid, threshold):
+    """Claim the right to send ONE alert for this event at this threshold.
+
+    Without this, every subsequent ticket sale past 80% would fire another email
+    and you'd get spammed all evening. Returns True for exactly one caller.
+    """
+    key = f"capalert:{eid}:{threshold}"
+    with cursor() as conn:
+        try:
+            conn.execute("INSERT INTO settings (key,value) VALUES (?,?)",
+                         (key, str(now())))
+            return True
+        except sqlite3.IntegrityError:
+            return False        # already sent
+
+
+def reset_capacity_alerts(eid):
+    """If you add more tickets, the alerts should be able to fire again."""
+    with cursor() as conn:
+        conn.execute("DELETE FROM settings WHERE key LIKE ?", (f"capalert:{eid}:%",))
+
+
+def sales_over_time(eid=None, days=30):
+    """Paid tickets and revenue per day — so you can see WHICH promo shifted tickets.
+
+    Grouped by the day the order was PAID (created_at on a paid order), not the
+    event date.
+    """
+    since = now() - days * 86400
+    sql = (
+        "SELECT o.created_at, o.total, o.discount_amount, o.booking_fee, "
+        "(SELECT COUNT(*) FROM tickets t WHERE t.order_id = o.id) AS tickets "
+        "FROM orders o WHERE o.status = 'paid' AND o.created_at >= ?"
+    )
+    params = [since]
+    if eid:
+        sql += " AND o.event_id = ?"
+        params.append(eid)
+    sql += " ORDER BY o.created_at"
+
+    with cursor() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    buckets = {}
+    for r in rows:
+        day = time.strftime("%Y-%m-%d", time.localtime(int(r["created_at"])))
+        b = buckets.setdefault(day, {"day": day, "tickets": 0, "revenue": 0, "orders": 0})
+        b["tickets"] += r["tickets"] or 0
+        b["revenue"] += r["total"] or 0
+        b["orders"] += 1
+
+    # Fill the gaps, so a quiet day shows as zero rather than vanishing.
+    out = []
+    for i in range(days, -1, -1):
+        day = time.strftime("%Y-%m-%d", time.localtime(now() - i * 86400))
+        out.append(buckets.get(day, {"day": day, "tickets": 0, "revenue": 0, "orders": 0}))
+    return out
+
+
+def sales_summary(eid=None):
+    sql = ("SELECT COUNT(*) orders, COALESCE(SUM(total),0) revenue, "
+           "COALESCE(SUM(discount_amount),0) discounts, "
+           "COALESCE(SUM(booking_fee),0) fees FROM orders WHERE status = 'paid'")
+    params = []
+    if eid:
+        sql += " AND event_id = ?"
+        params.append(eid)
+    with cursor() as conn:
+        row = conn.execute(sql, params).fetchone()
+        tix = conn.execute(
+            "SELECT COUNT(*) c FROM tickets t JOIN orders o ON o.id = t.order_id "
+            "WHERE o.status = 'paid'" + (" AND o.event_id = ?" if eid else ""),
+            params).fetchone()["c"]
+    return {"orders": row["orders"], "revenue": row["revenue"],
+            "discounts": row["discounts"], "fees": row["fees"], "tickets": tix}
+
+
+def busiest_day(eid=None, days=90):
+    rows = sales_over_time(eid, days)
+    best = max(rows, key=lambda r: r["tickets"], default=None)
+    return best if best and best["tickets"] else None
+
+
 def tickets_for_order(oid):
     with cursor() as conn:
         rows = conn.execute(
